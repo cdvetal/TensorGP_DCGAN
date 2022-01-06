@@ -344,17 +344,20 @@ def save_image(tensor, index, fn, dims, addon=''):
     final_tensor = tf.scalar_mul(255 / _domain_delta, final_tensor)
 
     aux = np.array(tensor, dtype='uint8')
-    if len(dims) == 2:
-        Image.fromarray(aux, mode="L").save(path) # no color
-    elif dims == 3:
-        Image.fromarray(aux, mode="RGB").save(path) # color
-    else:
-        print("Attempting to save tensor with rank ", len(dims), " as an image, must be rank 2 (grayscale) or 3 (RGB).")
+    try:
+        if len(dims) == 2:
+            Image.fromarray(aux, mode="L").save(path) # no color
+        elif len(dims) == 3:
+            Image.fromarray(aux, mode="RGB").save(path) # color
+        else:
+            print("Attempting to save tensor with rank ", len(dims), " as an image, must be rank 2 (grayscale) or 3 (RGB).")
+    except ValueError:
+        print()
     return path
 
 # just a wrapper for different expression types and strip preprocessing
 def str_to_tree(stree, terminal_set, constrain_domain=True):
-    return str_to_tree_normal(stree.strip() + "", terminal_set, 0, constrain_domain)
+    return str_to_tree_normal(stree.replace(" ", "") + "", terminal_set, 0, constrain_domain)
 
 
 def str_to_tree_normal(stree, terminal_set, number_nodes=0, constrain_domain = True):
@@ -385,7 +388,7 @@ def str_to_tree_normal(stree, terminal_set, number_nodes=0, constrain_domain = T
             elif c == ',' and pc == 0:
                 number_nodes, tree = str_to_tree_normal(args[last_pos:i], terminal_set, number_nodes, constrain_domain)
                 children.append(tree)
-                last_pos = i + 2
+                last_pos = i + 1
 
         number_nodes, tree = str_to_tree_normal(args[last_pos:], terminal_set, number_nodes, constrain_domain)
         children.append(tree)
@@ -475,7 +478,7 @@ class Engine:
     def crossover(self, parent_1, parent_2):
         crossover_node = None
 
-        if self.engine_rng.random() < 0.75 and not parent_1.terminal:  # TODO: review, this is Koza's rule
+        if self.engine_rng.random() < 0.9 and not parent_1.terminal:  # TODO: review, this is Koza's rule
             # function crossover
             parent_1_candidates = self.list_nodes(parent_1, True, add_funcs=True, add_terms=False, add_root=True)
             parent_1_chosen_node, _ = self.engine_rng.choice(parent_1_candidates)
@@ -760,6 +763,8 @@ class Engine:
                  initial_test_device = True,
                  previous_state = None,
                  var_func = None,
+                 stats_file_path = None,
+                 pop_file_path = None,
                  read_init_pop_from_file = None):
 
         # start timers
@@ -835,6 +840,8 @@ class Engine:
         self.save_state = 0
         self.last_stop = 0
         self.overall_stats_filename = "tensorgp_" + str(self.target_dims[0]) + "_" + str(self.experiment.seed) + '.csv'
+        self.stats_file_path = stats_file_path
+        self.pop_file_path = pop_file_path
 
 
         if mutation_funcs is None or mutation_funcs == []:
@@ -1191,7 +1198,7 @@ class Engine:
         #calculate fitness
         f_fitness_path = self.experiment.immigration_directory if immigration else self.experiment.current_directory
         population, best_pop, tensors = self.fitness_func_wrap(population=population,
-                                                      f_path=f_fitness_path)
+                                                                f_path=f_fitness_path)
 
         total_time = self.recent_fitness_time + self.recent_tensor_time
 
@@ -1211,10 +1218,11 @@ class Engine:
         return population, best_pop, tensors
 
 
-    def write_pop_to_csv(self):
+    def write_pop_to_csv(self, fp = None):
         if self.write_gen_stats:
             genstr = "gen_" + str(self.current_generation).zfill(5)
-            fn = self.experiment.logging_diredctory + genstr + "_stats.csv"
+            fn = self.experiment.logging_diredctory if fp is None else fp
+            fn += genstr + "_stats.csv"
             with open(fn, mode='w', newline='') as file:
                 fwriter = csv.writer(file, delimiter=',')
                 ind = 0
@@ -1302,7 +1310,7 @@ class Engine:
             self.best_overall = self.best
 
         # write first gen data
-        self.write_pop_to_csv()
+        self.write_pop_to_csv(self.pop_file_path)
         self.save_state_to_file(self.experiment.logging_diredctory)
         if self.debug > 2: self.print_engine_state(force_print=True)
 
@@ -1422,7 +1430,7 @@ class Engine:
                          pops['nodes'][0], pops['nodes'][1], pops['nodes'][2], pops['nodes'][3], tensors])
             print(bcolors.OKBLUE + "[%7d, %10.6f, %10.6f, %10.6f, %10.6f, %10.3f, %10.6f, %10d, %10d, %10.3f, %10.6f, %10d, %10d, %10.6f, %10.6f, %10.6f]" %((self.current_generation,) + tuple(data[-1][:-1]) + (self.recent_engine_time, self.recent_fitness_time, self.recent_tensor_time)), bcolors.ENDC)
 
-            self.write_pop_to_csv()
+            self.write_pop_to_csv(self.pop_file_path)
 
             # print engine state
             self.print_engine_state(force_print=False)
@@ -1432,7 +1440,7 @@ class Engine:
             self.experiment.seed += 1
 
         # write statistics(data) to csv
-        self.write_stats_to_csv(data)
+        self.write_stats_to_csv(data, self.stats_file_path)
 
         # print final stats
         if self.debug < 0:
@@ -1469,7 +1477,8 @@ class Engine:
         best_dep = []
         lcnt = 1
 
-        with open(self.experiment.working_directory + self.overall_stats_filename, mode='r') as csv_file:
+        fn = self.experiment.working_directory if self.stats_file_path is None else self.stats_file_path
+        with open(fn + self.overall_stats_filename, mode='r') as csv_file:
             csv_reader = csv.reader(csv_file)
             for row in csv_reader:
                 if self.debug > 10: print(row)
@@ -1511,9 +1520,10 @@ class Engine:
         plt.close(fig)
 
 
-    def write_stats_to_csv(self, data):
+    def write_stats_to_csv(self, data, fp = None):
         # evolutionary stats across generations
-        fn = self.experiment.working_directory + self.overall_stats_filename
+        fn = self.experiment.working_directory if fp is None else fp
+        fn += self.overall_stats_filename
         with open(fn, mode='a', newline='') as file:
             fwriter = csv.writer(file, delimiter=',')
             ind = 0
@@ -1715,7 +1725,7 @@ class Function_Set:
         if operator_name in self.set and self.debug > 0:
             print(bcolors.WARNING + "[WARNING]:\tOperator already existing in current function_set, overriding..." , bcolors.ENDC)
             if operator_name in self.operators_def and self.debug > 1:
-                print(bcolors.WARNING + "[WARNING]:\tOverriding operator", operator_name, ", which is an engine defined operator. This is not reccomended." , bcolors.ENDC)
+                print(bcolors.WARNING + "[WARNING]:\tOverriding operator", operator_name, ", which is an engine defined operator. This is not recommended." , bcolors.ENDC)
             self.remove_from_set(operator_name)
 
         self.set[operator_name] = [number_of_args, function_pointer]
@@ -1729,9 +1739,10 @@ class Function_Set:
         else:
             if operator_name in self.operators_def and self.debug > 0:
                 print(bcolors.WARNING + "[WARNING]:\tRemoving operator", operator_name, ", which is an engine defined operator. I hope you know what you are doing." , bcolors.ENDC)
-            ari = self.set[operator_name][0]
-            del self.set[operator_name]
-            self.arity[ari].remove(operator_name)
+            if operator_name != 'mult':
+                ari = self.set[operator_name][0]
+                del self.set[operator_name]
+                self.arity[ari].remove(operator_name)
 
     def __str__(self):
         res = "\nFunction Set:\n"
