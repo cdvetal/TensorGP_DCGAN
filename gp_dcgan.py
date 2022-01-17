@@ -1,106 +1,66 @@
-from tensorgp.engine import *
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import Input, Dense, Activation, Flatten, Reshape
-from tensorflow.keras.layers import Conv2D, Conv2DTranspose, UpSampling2D
-from tensorflow.keras.layers import LeakyReLU, Dropout
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras.optimizers import Adam, RMSprop
-from tensorflow.keras.initializers import RandomNormal, Zeros
-from tensorflow.keras.datasets import mnist
-import matplotlib.pyplot as plt
-import sys
-import numpy as np
+import tensorflow as tf
+tf.__version__
 
-full_fset = {'abs', 'add', 'and', 'clip', 'cos', 'div', 'exp', 'frac', 'if', 'len', 'lerp', 'log', 'max', 'mdist', 'min', 'mod', 'mult', 'neg', 'or', 'pow', 'sign', 'sin', 'sqrt', 'sstep', 'sstepp', 'step', 'sub', 'tan', 'warp', 'xor'}
-extended_fset = {'max', 'min', 'abs', 'add', 'and', 'or', 'mult', 'sub', 'xor', 'neg', 'cos', 'sin', 'tan', 'sqrt', 'div', 'exp', 'log', 'warp'}
+from tensorgp.engine import *
+
+#import glob
+#import imageio
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import PIL
+from tensorflow.keras import layers
+import time
+
+full_fset = {'abs', 'add', 'and', 'clip', 'cos', 'div', 'exp', 'frac', 'if', 'len', 'lerp', 'log', 'max', 'mdist',
+             'min', 'mod', 'mult', 'neg', 'or', 'pow', 'sign', 'sin', 'sqrt', 'sstep', 'sstepp', 'step', 'sub', 'tan',
+             'warp', 'xor'}
+extended_fset = {'max', 'min', 'abs', 'add', 'and', 'or', 'mult', 'sub', 'xor', 'neg', 'cos', 'sin', 'tan', 'sqrt',
+                 'div', 'exp', 'log', 'warp'}
 simple_set = {'add', 'sub', 'mult', 'div', 'sin', 'tan', 'cos'}
 normal_set = {'add', 'mult', 'sub', 'div', 'cos', 'sin', 'tan', 'abs', 'sign', 'pow'}
 custom_set = {'sstep', 'add', 'sub', 'mult', 'div', 'sin', 'tan', 'cos', 'log', 'warp'}
 
-class GAN(object):
-    def __init__(self):
-        self.img_rows = 28
-        self.img_cols = 28
-        self.channel = 1
-        self.img_shape = (self.img_rows, self.img_cols, self.channel)
-
-    def build_discriminator(self):
-        model = Sequential()
-        depth = 32
-        dropout = 0.25
-        input_shape = (self.img_rows, self.img_cols, self.channel)
-
-        model.add(Conv2D(depth * 1, 3, strides=2, input_shape=input_shape, padding='same',
-                         kernel_initializer='random_uniform'))
-        model.add(BatchNormalization(momentum=0.9))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(dropout))
-        model.add(Conv2D(depth * 2, 3, strides=2, padding='same', kernel_initializer='random_uniform'))
-        model.add(BatchNormalization(momentum=0.9))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(dropout))
-        model.add(Conv2D(depth * 4, 3, strides=2, padding='same', kernel_initializer='random_uniform'))
-        model.add(BatchNormalization(momentum=0.9))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(dropout))
-        model.add(Conv2D(depth * 8, 3, strides=2, padding='same', kernel_initializer='random_uniform'))
-        model.add(BatchNormalization(momentum=0.9))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(dropout))
-
-        # Each MNIST input = 28 X 28 X 1, depth = 1
-        # Each Output = 14 X 14 X 1, depth = 64
-        # Model has 4 convolutional layer, each with a dropout layer in between
-
-        # Output
-        model.add(Flatten())
-        model.add(Dense(1))
-        model.add(Activation('sigmoid'))
-        model.summary()
-
-        img = Input(shape=self.img_shape)
-        validity = model(img)
-
-        return Model(img, validity)
-
-        # generator takes noise as input and generates imgs
-
-    # Build and compile discriminator
-    def DM(self):
-        optimizer = Adam(0.0002, 0.5)
-        DM = self.build_discriminator()
-        DM.compile(loss='binary_crossentropy', optimizer=optimizer, metrics=['accuracy'])
-        return DM
 
 class dcgan(object):
-    def __init__(self, batch_size = 50, gens_per_batch = 100):
-        self.img_rows = 28
 
+    def __init__(self,
+                 batch_size=32,
+                 buffer_size=60000,
+                 gens_per_batch=100,
+                 run_dir=None,
+                 gp_fp=None):
+
+        self.img_rows = 28
         self.img_cols = 28
         self.channels = 1
+        self.input_shape = [self.img_rows, self.img_cols, self.channels]
+
+        self.run_dir = run_dir
+        self.gp_fp = gp_fp
+
         self.batch_size = batch_size
+        self.buffer_size = buffer_size
         self.gens_per_batch = gens_per_batch
         self.last_gen_imgs = []
 
-        self.GAN = GAN()
-        self.DM = self.GAN.DM()
-
-        #call generator
+        self.cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+        self.discriminator = self.make_discriminator_model()
+        self.disc_optimizer = tf.keras.optimizers.Adam(1e-4)
         resolution = [self.img_rows, self.img_cols]
-
         self.generator = Engine(fitness_func=self.disc_forward_pass,
                                 population_size=self.batch_size,
                                 tournament_size=3,
                                 mutation_rate=0.1,
                                 crossover_rate=0.95,
-                                max_tree_depth =10,
+                                max_tree_depth=10,
                                 target_dims=resolution,
-                                #method='grow',
+                                # method='grow',
                                 method='ramped half-and-half',
                                 objective='maximizing',
                                 device='/gpu:0',
                                 stop_criteria='generation',
-                                function_set=normal_set,
+                                operators=normal_set,
                                 min_init_depth=0,
                                 max_init_depth=10,
                                 min_domain=-1,
@@ -111,25 +71,27 @@ class dcgan(object):
                                 effective_dims=2,
                                 seed=202020212022,
                                 debug=0,
-                                save_to_file=10, # save all images from each 10 generations
+                                save_to_file=10,  # save all images from each 10 generations
                                 save_graphics=True,
                                 show_graphics=False,
                                 write_gen_stats=False,
-                                write_log = False,
-                                write_final_pop = True,
-                                read_init_pop_from_file = None)
+                                write_log=False,
+                                write_final_pop=True,
+                                stats_file_path=self.gp_fp,
+                                pop_file_path=self.gp_fp,
+                                read_init_pop_from_file=None)
 
-        # training input
-        # To change dataset, place dataset below
-        (self.x_train, _), (_, _) = mnist.load_data()
-        self.x_train = self.x_train / 127.5 - 1.
-        self.x_train = np.expand_dims(self.x_train, axis=3)
-        # x_train = x_train/127.5 -1.
-        # x_train = np.expand_dims(x_train, axis=3)
-        self.n_samples = 25
-        self.noise_dim = 100
+        self.gloss = 0
+        self.dloss = 0
+        self.training_time = 0
+        self.loss_hist = []
 
-    # maior predict do discriminador -> maior fitness
+        (self.x_train, _), (_, _) = tf.keras.datasets.mnist.load_data()
+        self.x_train = self.x_train.reshape(self.x_train.shape[0], self.img_rows, self.img_cols, self.channels).astype('float32')
+        self.x_train = (self.x_train - 127.5) / 127.5  # Normalize the images to [-1, 1]
+        self.train_dataset = tf.data.Dataset.from_tensor_slices(self.x_train).shuffle(self.buffer_size).batch(self.batch_size)
+
+
     def disc_forward_pass(self, **kwargs):
         population = kwargs.get('population')
         generation = kwargs.get('generation')
@@ -147,12 +109,14 @@ class dcgan(object):
         fn = f_path + "gen" + str(generation).zfill(5)
         fitness = []
         best_ind = 0
-        fit_array = self.DM.predict(np.array(np.expand_dims(tensors, axis = 3)))
+        # TODO: is predict okay here?
+        fit_array = self.discriminator(np.array(np.expand_dims(tensors, axis=3)), training=False)
+        #fit_array = self.discriminator.predict(np.array(np.expand_dims(tensors, axis=3)))
         # scores
         for index in range(len(tensors)):
             if generation % _stf == 0:
                 save_image(tensors[index], index, fn, _resolution)  # save image
-            fit = fit_array[index]
+            fit = float(fit_array[index][0])
 
             if condition():
                 max_fit = fit
@@ -165,60 +129,94 @@ class dcgan(object):
             save_image(tensors[best_ind], best_ind, fn, _resolution, addon='_best')
         return population, best_ind
 
-    # method to generate noise
-    def gennoise(self, batch_size):
-        x = np.random.normal(0, 1.0, (batch_size, self.noise_dim))
-        return x
 
-    def plt_imgs(self, epoch):
+    def make_discriminator_model(self):
+        model = tf.keras.Sequential()
+        model.add(layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=self.input_shape))
+        model.add(layers.LeakyReLU())
+        model.add(layers.Dropout(0.3))
+        model.add(layers.Conv2D(128, (5, 5), strides=(2, 2), padding='same'))
+        model.add(layers.LeakyReLU())
+        model.add(layers.Dropout(0.3))
+
+        model.add(layers.Flatten())
+        model.add(layers.Dense(1))
+        return model
+
+    def compute_losses(self, gen_output):
+        self.dloss = self.cross_entropy(tf.zeros_like(gen_output), gen_output)
+        self.gloss = -self.dloss
+        self.loss_hist = [self.dloss, self.gloss]
+
+    def print_training_hist(self):
+        for h in self.loss_hist:
+            print(h)
+
+    def train_step(self):
+
+        with tf.GradientTape() as disc_tape:
+            _, generated_images = self.generator.run(self.batch_size)
+            self.last_gen_imgs = np.expand_dims(generated_images, axis=3)
+            gen_output = self.discriminator(self.last_gen_imgs, training=True)
+
+            self.compute_losses(gen_output)
+
+            gradients_of_discriminator = disc_tape.gradient(self.dloss, self.discriminator.trainable_variables)
+            self.disc_optimizer.apply_gradients(zip(gradients_of_discriminator, self.discriminator.trainable_variables))
+
+
+    def train(self, epochs=50):
+        start = time.time()
+        for epoch in range(epochs):
+            self.train_step()
+
+            #for image_batch in self.dataset:
+
+            # Save the model every 15 epochs
+            self.generate_and_save_images(epoch + 1)
+            if (epoch + 1) % 15 == 0:
+                pass
+                # checkpoint.save(file_prefix=checkpoint_prefix)
+
+            print('Time for epoch {} is {} sec'.format(epoch + 1, time.time() - start))
+
+        # Generate after the final epoch
+        # display.clear_output(wait=True)
+        self.generate_and_save_images(epochs)
+        self.training_time = time.time() - start
+        return self.training_time, self.loss_hist
+
+
+    def generate_and_save_images(self, epoch):
         self.last_gen_imgs = np.array(self.last_gen_imgs)
         self.last_gen_imgs = 0.5 * self.last_gen_imgs + 0.5  # .... [-1, 1] to [0, 1]
 
-        fig, axs = plt.subplots(5, 5)
-        count = 0
-        for i in range(5):
-            for j in range(5):
-                axs[i, j].imshow(self.last_gen_imgs[count, :, :, 0], cmap='gray')
-                axs[i, j].axis('off')
-                count += 1
+        fig = plt.figure(figsize=(8, 4))
+        for i in range(self.last_gen_imgs.shape[0]):
+            plt.subplot(8, 4, i + 1)
+            plt.imshow(self.last_gen_imgs[i, :, :, 0] * 127.5 + 127.5, cmap='gray')
+            plt.axis('off')
 
-        fig.savefig("mnist_%d.png" % epoch)
-        plt.close()
+        plt.savefig('dcgan_images/image_at_epoch_{:04d}.png'.format(epoch))
+        # plt.show()
 
-    def train(self, n_epochs):
-        train_hist = {'D_losses': [], 'G_losses': []}
 
-        print("Start")
-        true_labels = np.ones((self.batch_size, 1))
-        gen_gene_labels = np.zeros((self.batch_size, 1))
-
-        for epoch in range(n_epochs):
-
-            index = np.random.randint(0, self.x_train.shape[0], self.batch_size)
-            images = self.x_train[index]
-
-            # train generator
-            _, gen_imgs = self.generator.run(self.batch_size)
-
-            # traind disc
-            d_loss = self.DM.train_on_batch(images, true_labels)
-            d_loss_generated = self.DM.train_on_batch(gen_imgs, gen_gene_labels)
-            total_d_loss = 0.5 * np.add(d_loss, d_loss_generated)
-
-            train_hist['D_losses'].append(total_d_loss[0])
-
-            g_loss = -total_d_loss[0]
-            #g_loss = self.combined.train_on_batch(noise_data, y1)
-
-            train_hist['G_losses'].append(g_loss)
-            print(' Epoch:{}, G_loss: {}, D_loss:{}'.format(epoch + 1, g_loss, total_d_loss[0]))
-
-            if epoch % 50 == 0:
-                self.plt_imgs(epoch)
-
-        return train_hist
-
+EPOCHS = 100
+noise_dim = 100
+num_examples_to_generate = 16
+seed = tf.random.normal([num_examples_to_generate, noise_dim])
 
 if __name__ == '__main__':
-    mnist_dcgan = dcgan(batch_size=32)
-    hist = mnist_dcgan.train(2)
+    date = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3]
+    print(date)
+    run_dir = os.getcwd() + delimiter + "gp_dcgan_results" + delimiter + "run__" + date + delimiter
+    gp_fp = run_dir + "gp" + delimiter
+    os.makedirs(run_dir)
+    os.makedirs(gp_fp)
+    gens = 1
+    gen_pop = 32
+
+    mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=gens, run_dir=run_dir, gp_fp=gp_fp)
+    train_time, train_hist = mnist_dcgan.train(epochs = EPOCHS)
+    print("Elapsed training time (s): ", train_time)
+    mnist_dcgan.print_training_hist()
