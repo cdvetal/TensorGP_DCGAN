@@ -19,8 +19,8 @@ extended_fset = {'max', 'min', 'abs', 'add', 'and', 'or', 'mult', 'sub', 'xor', 
                  'div', 'exp', 'log', 'warp'}
 simple_set = {'add', 'sub', 'mult', 'div', 'sin', 'tan', 'cos'}
 normal_set = {'add', 'mult', 'sub', 'div', 'cos', 'sin', 'tan', 'abs', 'sign', 'pow'}
-custom_set = {'sstep', 'add', 'sub', 'mult', 'div', 'sin', 'tan', 'cos', 'log', 'warp'}
-
+#custom_set = {'sstep', 'add', 'sub', 'mult', 'div', 'sin', 'tan', 'cos', 'log', 'warp'}
+custom_set = {'add', 'cos', 'div', 'if', 'min', 'mult', 'sin', 'sub', 'tan', 'sstepp'}
 
 class dcgan(object):
 
@@ -36,8 +36,14 @@ class dcgan(object):
         self.channels = 1
         self.input_shape = [self.img_rows, self.img_cols, self.channels]
 
-        self.run_dir = run_dir
-        self.gp_fp = gp_fp
+        date = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3]
+        #print(date)
+        self.run_dir = os.getcwd() + delimiter + "gp_dcgan_results" + delimiter + "run__" + date + delimiter if run_dir is None else run_dir
+        self.gp_fp = self.run_dir + "gp" + delimiter if gp_fp is None else gp_fp
+        self.gan_images = self.run_dir + "dcgan_images" + delimiter
+
+        #os.makedirs(self.run_dir)
+        #print("Created dir: ", self.run_dir)
 
         self.batch_size = batch_size
         self.buffer_size = buffer_size
@@ -50,36 +56,48 @@ class dcgan(object):
         resolution = [self.img_rows, self.img_cols]
         self.generator = Engine(fitness_func=self.disc_forward_pass,
                                 population_size=self.batch_size,
-                                tournament_size=3,
-                                mutation_rate=0.1,
-                                crossover_rate=0.95,
-                                max_tree_depth=10,
+                                tournament_size=2,
+                                mutation_rate=0.2,
+                                crossover_rate=0.8,
+                                max_tree_depth=14,
                                 target_dims=resolution,
                                 # method='grow',
                                 method='ramped half-and-half',
                                 objective='maximizing',
                                 device='/gpu:0',
                                 stop_criteria='generation',
-                                operators=normal_set,
-                                min_init_depth=0,
-                                max_init_depth=10,
+                                operators=custom_set,
+                                min_init_depth=3,
+                                max_init_depth=6,
+                                terminal_prob=0.5,
                                 min_domain=-1,
                                 max_domain=1,
-                                bloat_control='dynamic_dep',
-                                elitism=0,
-                                stop_value=self.gens_per_batch,
+                                bloat_control='std',
+                                elitism=1,
+                                stop_value=self.gens_per_batch - 1,
                                 effective_dims=2,
                                 seed=202020212022,
                                 debug=0,
-                                save_to_file=10,  # save all images from each 10 generations
+                                save_to_file=10000,  # save all images from each 10 generations
+                                minimal_print=True,
                                 save_graphics=True,
                                 show_graphics=False,
                                 write_gen_stats=False,
                                 write_log=False,
                                 write_final_pop=True,
-                                stats_file_path=self.gp_fp,
-                                pop_file_path=self.gp_fp,
-                                read_init_pop_from_file=None)
+                                stats_file_path=self.run_dir,
+                                pop_file_path=self.run_dir,
+                                run_dir_path=self.gp_fp,
+                                read_init_pop_from_file=None,
+                                mutation_funcs=[Engine.subtree_mutation, Engine.point_mutation,
+                                                Engine.delete_mutation, Engine.insert_mutation],
+                                mutation_probs=[0.6, 0.2, 0.1, 0.1]
+                                )
+
+        #os.makedirs(self.gp_fp)
+        #print("Created dir: ", self.gp_fp)
+        os.makedirs(self.gan_images)
+        #print("Created dir: ", self.gan_images)
 
         self.gloss = 0
         self.dloss = 0
@@ -99,34 +117,41 @@ class dcgan(object):
         f_path = kwargs.get('f_path')
         _resolution = kwargs.get('resolution')
         _stf = kwargs.get('stf')
+        #_best_o = kwargs.get('best_o')
+
+        #print("Best overall message3.31: ", _best_o['fitness'])
 
         images = True
         # set objective function according to min/max
         fit = 0
-        condition = lambda: (fit > max_fit)  # maximizing
         max_fit = float('-inf')
+
 
         fn = f_path + "gen" + str(generation).zfill(5)
         fitness = []
         best_ind = 0
         # TODO: is predict okay here?
         fit_array = self.discriminator(np.array(np.expand_dims(tensors, axis=3)), training=False)
-        #fit_array = self.discriminator.predict(np.array(np.expand_dims(tensors, axis=3)))
         # scores
+        #print("Best overall message3.315: ", _best_o['fitness'])
         for index in range(len(tensors)):
             if generation % _stf == 0:
                 save_image(tensors[index], index, fn, _resolution)  # save image
             fit = float(fit_array[index][0])
 
-            if condition():
+            if fit > max_fit:
                 max_fit = fit
                 best_ind = index
             fitness.append(fit)
             population[index]['fitness'] = fit
+            #print("Best overall message3.31r: ", _best_o['fitness'])
+
+        #print("Best overall message3.32: ", _best_o['fitness'])
 
         # save best indiv
         if images:
             save_image(tensors[best_ind], best_ind, fn, _resolution, addon='_best')
+        #print("Best overall message3.33: ", _best_o['fitness'])
         return population, best_ind
 
 
@@ -155,7 +180,7 @@ class dcgan(object):
     def train_step(self):
 
         with tf.GradientTape() as disc_tape:
-            _, generated_images = self.generator.run(self.batch_size)
+            _, generated_images = self.generator.run(self.gens_per_batch)
             self.last_gen_imgs = np.expand_dims(generated_images, axis=3)
             gen_output = self.discriminator(self.last_gen_imgs, training=True)
 
@@ -178,7 +203,7 @@ class dcgan(object):
                 pass
                 # checkpoint.save(file_prefix=checkpoint_prefix)
 
-            print('Time for epoch {} is {} sec'.format(epoch + 1, time.time() - start))
+            print('[GAN]:\tTime for epoch {} is {} sec'.format(epoch + 1, time.time() - start))
 
         # Generate after the final epoch
         # display.clear_output(wait=True)
@@ -193,30 +218,19 @@ class dcgan(object):
 
         fig = plt.figure(figsize=(8, 4))
         for i in range(self.last_gen_imgs.shape[0]):
-            plt.subplot(8, 4, i + 1)
+            plt.subplot(4, 8, i + 1)
             plt.imshow(self.last_gen_imgs[i, :, :, 0] * 127.5 + 127.5, cmap='gray')
             plt.axis('off')
 
-        plt.savefig('dcgan_images/image_at_epoch_{:04d}.png'.format(epoch))
-        # plt.show()
+        plt.savefig(self.gan_images + 'image_at_epoch_{:04d}.png'.format(epoch))
 
-
-EPOCHS = 100
-noise_dim = 100
-num_examples_to_generate = 16
-seed = tf.random.normal([num_examples_to_generate, noise_dim])
 
 if __name__ == '__main__':
-    date = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3]
-    print(date)
-    run_dir = os.getcwd() + delimiter + "gp_dcgan_results" + delimiter + "run__" + date + delimiter
-    gp_fp = run_dir + "gp" + delimiter
-    os.makedirs(run_dir)
-    os.makedirs(gp_fp)
-    gens = 1
+    epochs = 100
+    gens = 50
     gen_pop = 32
 
-    mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=gens, run_dir=run_dir, gp_fp=gp_fp)
-    train_time, train_hist = mnist_dcgan.train(epochs = EPOCHS)
+    mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=gens)
+    train_time, train_hist = mnist_dcgan.train(epochs = epochs)
     print("Elapsed training time (s): ", train_time)
     mnist_dcgan.print_training_hist()
