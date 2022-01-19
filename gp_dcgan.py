@@ -86,6 +86,7 @@ class dcgan(object):
                                 write_log=False,
                                 write_final_pop=True,
                                 stats_file_path=self.run_dir,
+                                graphics_file_path=self.run_dir,
                                 pop_file_path=self.run_dir,
                                 run_dir_path=self.gp_fp,
                                 read_init_pop_from_file=None,
@@ -114,29 +115,17 @@ class dcgan(object):
         population = kwargs.get('population')
         generation = kwargs.get('generation')
         tensors = kwargs.get('tensors')
-        f_path = kwargs.get('f_path')
         _resolution = kwargs.get('resolution')
-        _stf = kwargs.get('stf')
-        #_best_o = kwargs.get('best_o')
 
-        #print("Best overall message3.31: ", _best_o['fitness'])
-
-        images = True
-        # set objective function according to min/max
         fit = 0
         max_fit = float('-inf')
 
-
-        fn = f_path + "gen" + str(generation).zfill(5)
         fitness = []
         best_ind = 0
         # TODO: is predict okay here?
         fit_array = self.discriminator(np.array(np.expand_dims(tensors, axis=3)), training=False)
         # scores
-        #print("Best overall message3.315: ", _best_o['fitness'])
         for index in range(len(tensors)):
-            if generation % _stf == 0:
-                save_image(tensors[index], index, fn, _resolution)  # save image
             fit = float(fit_array[index][0])
 
             if fit > max_fit:
@@ -144,14 +133,7 @@ class dcgan(object):
                 best_ind = index
             fitness.append(fit)
             population[index]['fitness'] = fit
-            #print("Best overall message3.31r: ", _best_o['fitness'])
 
-        #print("Best overall message3.32: ", _best_o['fitness'])
-
-        # save best indiv
-        if images:
-            save_image(tensors[best_ind], best_ind, fn, _resolution, addon='_best')
-        #print("Best overall message3.33: ", _best_o['fitness'])
         return population, best_ind
 
 
@@ -226,8 +208,8 @@ class dcgan(object):
 
 
 if __name__ == '__main__':
-    epochs = 100
-    gens = 50
+    epochs = 10
+    gens = 5
     gen_pop = 32
 
     mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=gens)
