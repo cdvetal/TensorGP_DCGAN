@@ -57,7 +57,7 @@ class dcgan(object):
         self.generator = Engine(fitness_func=self.disc_forward_pass,
                                 population_size=self.batch_size,
                                 tournament_size=2,
-                                mutation_rate=0.2,
+                                mutation_rate=0.3,
                                 crossover_rate=0.8,
                                 max_tree_depth=14,
                                 target_dims=resolution,
@@ -74,7 +74,8 @@ class dcgan(object):
                                 max_domain=1,
                                 bloat_control='std',
                                 elitism=1,
-                                stop_value=self.gens_per_batch - 1,
+                                #stop_value=self.gens_per_batch - 1,
+                                stop_value=0,
                                 effective_dims=2,
                                 seed=202020212022,
                                 debug=0,
@@ -108,7 +109,9 @@ class dcgan(object):
         (self.x_train, _), (_, _) = tf.keras.datasets.mnist.load_data()
         self.x_train = self.x_train.reshape(self.x_train.shape[0], self.img_rows, self.img_cols, self.channels).astype('float32')
         self.x_train = (self.x_train - 127.5) / 127.5  # Normalize the images to [-1, 1]
-        self.train_dataset = tf.data.Dataset.from_tensor_slices(self.x_train).shuffle(self.buffer_size).batch(self.batch_size)
+        #print(self.x_train.shape)
+
+        #self.train_dataset = tf.data.Dataset.from_tensor_slices(self.x_train).shuffle(self.buffer_size)
 
 
     def disc_forward_pass(self, **kwargs):
@@ -150,8 +153,10 @@ class dcgan(object):
         model.add(layers.Dense(1))
         return model
 
-    def compute_losses(self, gen_output):
-        self.dloss = self.cross_entropy(tf.zeros_like(gen_output), gen_output)
+    def compute_losses(self, gen_output, real_output):
+        gen_loss = self.cross_entropy(tf.zeros_like(gen_output), gen_output)
+        real_loss = self.cross_entropy(tf.ones_like(real_output), real_output)
+        self.dloss = gen_loss + real_loss
         self.gloss = -self.dloss
         self.loss_hist = [self.dloss, self.gloss]
 
@@ -159,14 +164,19 @@ class dcgan(object):
         for h in self.loss_hist:
             print(h)
 
-    def train_step(self):
+    def train_step(self, epoch):
+
+        index = np.random.randint(0, self.x_train.shape[0], self.batch_size)
+        images = self.x_train[index]
 
         with tf.GradientTape() as disc_tape:
-            _, generated_images = self.generator.run(self.gens_per_batch)
+            #_, generated_images = self.generator.run(self.gens_per_batch)
+            _, generated_images = self.generator.run(epoch + 1)
             self.last_gen_imgs = np.expand_dims(generated_images, axis=3)
             gen_output = self.discriminator(self.last_gen_imgs, training=True)
+            real_output = self.discriminator(images, training=True)
 
-            self.compute_losses(gen_output)
+            self.compute_losses(gen_output, real_output)
 
             gradients_of_discriminator = disc_tape.gradient(self.dloss, self.discriminator.trainable_variables)
             self.disc_optimizer.apply_gradients(zip(gradients_of_discriminator, self.discriminator.trainable_variables))
@@ -175,7 +185,7 @@ class dcgan(object):
     def train(self, epochs=50):
         start = time.time()
         for epoch in range(epochs):
-            self.train_step()
+            self.train_step(epoch)
 
             #for image_batch in self.dataset:
 
@@ -185,7 +195,7 @@ class dcgan(object):
                 pass
                 # checkpoint.save(file_prefix=checkpoint_prefix)
 
-            print('[GAN]:\tTime for epoch {} is {} sec'.format(epoch + 1, time.time() - start))
+            print('[GAN]:\t[Gloss, Dloss]: [{}, {}]\tTime for epoch {} is {} sec'.format(self.gloss, self.dloss, epoch + 1, time.time() - start))
 
         # Generate after the final epoch
         # display.clear_output(wait=True)
@@ -208,8 +218,8 @@ class dcgan(object):
 
 
 if __name__ == '__main__':
-    epochs = 10
-    gens = 5
+    epochs = 100
+    gens = 50
     gen_pop = 32
 
     mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=gens)
