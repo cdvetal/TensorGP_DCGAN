@@ -1,5 +1,4 @@
 import tensorflow as tf
-tf.__version__
 
 from tensorgp.engine import *
 
@@ -12,15 +11,15 @@ import PIL
 from tensorflow.keras import layers
 import time
 
-full_fset = {'abs', 'add', 'and', 'clip', 'cos', 'div', 'exp', 'frac', 'if', 'len', 'lerp', 'log', 'max', 'mdist',
+full_set = {'abs', 'add', 'and', 'clip', 'cos', 'div', 'exp', 'frac', 'if', 'len', 'lerp', 'log', 'max', 'mdist',
              'min', 'mod', 'mult', 'neg', 'or', 'pow', 'sign', 'sin', 'sqrt', 'sstep', 'sstepp', 'step', 'sub', 'tan',
              'warp', 'xor'}
-extended_fset = {'max', 'min', 'abs', 'add', 'and', 'or', 'mult', 'sub', 'xor', 'neg', 'cos', 'sin', 'tan', 'sqrt',
+extended_set = {'max', 'min', 'abs', 'add', 'and', 'or', 'mult', 'sub', 'xor', 'neg', 'cos', 'sin', 'tan', 'sqrt',
                  'div', 'exp', 'log', 'warp'}
 simple_set = {'add', 'sub', 'mult', 'div', 'sin', 'tan', 'cos'}
 normal_set = {'add', 'mult', 'sub', 'div', 'cos', 'sin', 'tan', 'abs', 'sign', 'pow'}
 #custom_set = {'sstep', 'add', 'sub', 'mult', 'div', 'sin', 'tan', 'cos', 'log', 'warp'}
-custom_set = {'add', 'cos', 'div', 'if', 'min', 'mult', 'sin', 'sub', 'tan', 'sstepp'}
+custom_set = {'add', 'cos', 'div', 'if', 'min', 'mult', 'sin', 'sub', 'tan', 'warp'}
 
 class dcgan(object):
 
@@ -28,6 +27,9 @@ class dcgan(object):
                  batch_size=32,
                  buffer_size=60000,
                  gens_per_batch=100,
+                 run_from_last_pop = True,
+                 linear_gens_per_batch = False,
+                 fset = None,
                  run_dir=None,
                  gp_fp=None):
 
@@ -41,6 +43,8 @@ class dcgan(object):
         self.run_dir = os.getcwd() + delimiter + "gp_dcgan_results" + delimiter + "run__" + date + delimiter if run_dir is None else run_dir
         self.gp_fp = self.run_dir + "gp" + delimiter if gp_fp is None else gp_fp
         self.gan_images = self.run_dir + "dcgan_images" + delimiter
+        self.run_from_last_pop = run_from_last_pop
+        self.linear_gens_per_batch = linear_gens_per_batch
 
         #os.makedirs(self.run_dir)
         #print("Created dir: ", self.run_dir)
@@ -54,6 +58,8 @@ class dcgan(object):
         self.discriminator = self.make_discriminator_model()
         self.disc_optimizer = tf.keras.optimizers.Adam(1e-4)
         resolution = [self.img_rows, self.img_cols]
+        self.fset = normal_set if fset is None else fset
+        stop_value = self.gens_per_batch - 1 if self.linear_gens_per_batch else 0
         self.generator = Engine(fitness_func=self.disc_forward_pass,
                                 population_size=self.batch_size,
                                 tournament_size=2,
@@ -66,7 +72,7 @@ class dcgan(object):
                                 objective='maximizing',
                                 device='/gpu:0',
                                 stop_criteria='generation',
-                                operators=custom_set,
+                                operators=self.fset,
                                 min_init_depth=3,
                                 max_init_depth=6,
                                 terminal_prob=0.5,
@@ -74,8 +80,7 @@ class dcgan(object):
                                 max_domain=1,
                                 bloat_control='std',
                                 elitism=1,
-                                #stop_value=self.gens_per_batch - 1,
-                                stop_value=0,
+                                stop_value=stop_value,
                                 effective_dims=2,
                                 seed=202020212022,
                                 debug=0,
@@ -110,6 +115,7 @@ class dcgan(object):
         self.x_train = self.x_train.reshape(self.x_train.shape[0], self.img_rows, self.img_cols, self.channels).astype('float32')
         self.x_train = (self.x_train - 127.5) / 127.5  # Normalize the images to [-1, 1]
         #print(self.x_train.shape)
+
 
         #self.train_dataset = tf.data.Dataset.from_tensor_slices(self.x_train).shuffle(self.buffer_size)
 
@@ -170,8 +176,8 @@ class dcgan(object):
         images = self.x_train[index]
 
         with tf.GradientTape() as disc_tape:
-            #_, generated_images = self.generator.run(self.gens_per_batch)
-            _, generated_images = self.generator.run(epoch + 1)
+            ep = self.gens_per_batch if self.linear_gens_per_batch else epoch + 1
+            _, generated_images = self.generator.run(stop_value = ep, start_from_last_pop=self.run_from_last_pop)
             self.last_gen_imgs = np.expand_dims(generated_images, axis=3)
             gen_output = self.discriminator(self.last_gen_imgs, training=True)
             real_output = self.discriminator(images, training=True)
@@ -219,10 +225,24 @@ class dcgan(object):
 
 if __name__ == '__main__':
     epochs = 100
-    gens = 50
     gen_pop = 32
+    #run_from_last_pop = True
+    #linear_gens_per_batch = True
 
-    mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=gens)
-    train_time, train_hist = mnist_dcgan.train(epochs = epochs)
-    print("Elapsed training time (s): ", train_time)
-    mnist_dcgan.print_training_hist()
+    gens = [100]
+    fsets = [normal_set, custom_set, extended_set]
+    bv = [True, False]
+
+    for g in gens:
+        for cur_set in fsets:
+            for rflp in bv:
+                for lgpb in bv:
+                    print("\nCurrent number of gens: ", g)
+                    print("Current set: ", str(cur_set))
+                    print("CRun from last pop?: ", rflp)
+                    print("Linear gens per batch?\n: ", lgpb)
+                    mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=g, fset=cur_set,
+                                    run_from_last_pop=rflp, linear_gens_per_batch=lgpb)
+                    train_time, train_hist = mnist_dcgan.train(epochs = epochs)
+                    print("Elapsed training time (s): ", train_time)
+                    mnist_dcgan.print_training_hist()
