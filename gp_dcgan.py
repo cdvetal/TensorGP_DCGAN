@@ -1,6 +1,6 @@
 import tensorflow as tf
 
-from tensorgp.engine_2 import *
+from tensorgp.engine import *
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -14,7 +14,6 @@ from keras.models import load_model
 from skimage import io
 from skimage.transform import resize
 from skimage.color import rgb2gray
-
 
 # function sets available
 full_set = {'abs', 'add', 'and', 'clip', 'cos', 'div', 'exp', 'frac', 'if', 'len', 'lerp', 'log', 'max', 'mdist',
@@ -208,7 +207,7 @@ class dcgan(object):
             _, generated_images = self.generator.run(stop_value=ep, start_from_last_pop=self.run_from_last_pop)
 
 
-            self.archive += [nsmallest(self.archive_save, self.generator.population, key=itemgetter('fitness'))]
+            self.archive += [nlargest(self.archive_save, self.generator.population, key=itemgetter('fitness'))]
 
             # tf.debugging.assert_greater_equal(generated_images, -1.0, message="Less than min domain!")
             # tf.debugging.assert_less_equal(generated_images, 1.0, message="Grater than max domain!")
@@ -332,7 +331,7 @@ if __name__ == '__main__':
     # run_from_last_pop = True
     # linear_gens_per_batch = True
 
-    gens = [50]
+    gens = [5]
     epochs = 5
     #fsets = [custom_set, extended_set, normal_set, std_set]
     fsets = [normal_set]
