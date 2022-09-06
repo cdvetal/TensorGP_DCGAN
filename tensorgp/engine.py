@@ -25,13 +25,13 @@
 
 
 import csv
-import sys
 from collections import Counter
 import copy
 import datetime
 import math
 import os
 import re
+
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -46,20 +46,32 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 import numpy as np
 
-delimiter = os.path.sep
-subdir = "runs"
+from skimage import io
+from skimage.transform import resize
+from skimage.color import rgb2gray
 
-# evil global variables
-_min_domain = -1
-_max_domain = 1
+# Evil global variables
+_tgp_np_debug = 1
+_tgp_delimiter = os.path.sep
+_tgp_subdir = "runs"
+
+_min_domain = -1.0
+_max_domain = 1.0
 _domain_delta = _max_domain - _min_domain
+_codomain = [-1.0, 1.0]
+_codomain_delta = _codomain[1] - _codomain[0]
+_final_transform = [0.0, 255.0]
+_final_transform_delta = _final_transform[1] - _final_transform[0]
+_do_final_transform = False
+
 
 # np debug options
-#np.set_printoptions(linewidth = 1000)
-#np.set_printoptions(precision = 3)
+if _tgp_np_debug:
+    np.set_printoptions(linewidth = 1000)
+    np.set_printoptions(precision = 3)
+
 
 #taken from https://svn.blender.org/svnroot/bf-blender/trunk/blender/build_files/scons/tools/bcolors.py
-
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
@@ -71,7 +83,8 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-## ====================== tensorflow operators ====================== ##
+## ====================== Standard TensorFlow Ops  ====================== ##
+
 def resolve_var_node(dimensions, n):
     temp = np.ones(len(dimensions), dtype=int)
     temp[n] = -1
@@ -140,9 +153,8 @@ def resolve_mult_node(child1, child2, dims=[]):
 def resolve_neg_node(child1, dims=[]):
     return tf.math.negative(child1)
 
-
 def resolve_pow_node(child1, child2, dims=[]):
-    return tf.where(child1 == 0, tf.constant(0, tf.float32, dims), tf.math.pow(tf.math.abs(child1), tf.math.abs(child2)));
+    return tf.where(child1 == 0, tf.constant(0, tf.float32, dims), tf.math.pow(tf.math.abs(child1), tf.math.abs(child2)))
 
 def resolve_sign_node(child1, dims=[]):
     #return tf.math.divide_no_nan(tf.math.abs(child1),child1)
@@ -192,19 +204,19 @@ def resolve_sstepp_node(child1, dims=[]):
     x = resolve_clamp(child1)
     x2 = tf.square(x)
     return tf.add(tf.multiply(x2,
-                              tf.subtract(tf.scalar_mul(6.0 * _domain_delta, tf.multiply(x, x2)),
-                                          tf.subtract(tf.scalar_mul(15.0 * _domain_delta, x2),
-                                                      tf.scalar_mul(10.0 * _domain_delta, x)))),
-                  tf.constant(_min_domain, dtype=tf.float32, shape=dims))
+                              tf.subtract(tf.scalar_mul(6.0 * _codomain_delta, tf.multiply(x, x2)),
+                                          tf.subtract(tf.scalar_mul(15.0 * _codomain_delta, x2),
+                                                      tf.scalar_mul(10.0 * _codomain_delta, x)))),
+                  tf.constant(_codomain[0], dtype=tf.float32, shape=dims))
 
 # return x * x * (3 - 2 * x);
 # simplified to (6x2 - 4x3) to minimize TF operations
 def resolve_sstep_node(child1, dims=[]):
     x = resolve_clamp(child1)
     x2 = tf.square(x)
-    return tf.add(tf.subtract(tf.scalar_mul(3.0 * _domain_delta, x2),
-                              tf.scalar_mul(2.0 * _domain_delta, tf.multiply(x2, x))),
-                  tf.constant(_min_domain, dtype=tf.float32, shape=dims))
+    return tf.add(tf.subtract(tf.scalar_mul(3.0 * _codomain_delta, x2),
+                              tf.scalar_mul(2.0 * _codomain_delta, tf.multiply(x2, x))),
+                  tf.constant(_codomain[0], dtype=tf.float32, shape=dims))
 
 def resolve_step_node(child1, dims=[]):
     return tf.where(child1 < 0.0,
@@ -212,7 +224,7 @@ def resolve_step_node(child1, dims=[]):
                     tf.constant(1.0, dtype=tf.float32, shape=dims))
 
 def resolve_clamp(tensor):
-    return tf.clip_by_value(tensor, clip_value_min=_min_domain, clip_value_max=_max_domain)
+    return tf.clip_by_value(tensor, clip_value_min=_codomain[0], clip_value_max=_codomain[1])
     #return tf.cast(tf.cast(tensor, tf.uint8), tf.float32)
 
 def resolve_frac_node(child1, dims=[]):
@@ -225,7 +237,7 @@ def resolve_len_node(child1, child2, dims=[]):
     return tf.sqrt(tf.add(tf.square(child1), tf.square(child2)))
 
 def resolve_lerp_node(child1, child2, child3, dims=[]):
-    child3 = resolve_frac_node(child3, dims)
+    #child3 = resolve_frac_node(child3, dims)
     t_dist = tf.subtract(child2, child1)
     t_dist = tf.multiply(child3, t_dist)
     return tf.math.add(child1, t_dist)
@@ -239,13 +251,15 @@ def old_tf_rmse(child1, child2):
     mse = math.sqrt(mse)
     return mse
 
+# The idea is that this is always the same, so compile
 @tf.function
 def tf_rmse(child1, child2):
     child1 = tf.scalar_mul(1/127.5, child1)
     child2 = tf.scalar_mul(1/127.5, child2)
     return tf.sqrt(tf.reduce_mean(tf.square(child1 - child2)))
 
-## ====================== tensorflow node class ====================== ##
+
+## ====================== TensorFlow Node Class ====================== ##
 
 class Node:
     def __init__(self, value, children, terminal):
@@ -254,30 +268,24 @@ class Node:
         self.terminal = terminal
 
     def node_tensor(self, tens, engref):
-
         arity = engref.function.set[self.value][0]
+
         if self.value != 'warp':
             arg_list = tens[:arity]
         else:
             arg_list = [tens[1:] + list(engref.terminal.latentset.values()), tens[0]]
-
         arg_list += [engref.target_dims]
 
         return engref.function.set[self.value][1](*arg_list)
 
 
-    def get_tensor(self, engref):
-
+    def get_tensor(self, engref, dynamic_lerp = None):
         if self.terminal:
             if self.value == 'scalar':
                 args = len(self.children)
-
-
                 if args == 1:
                     return tf.constant(self.children[0], tf.float32, engref.target_dims)
                 else:
-                    #print("we should not be here!")
-                    #last_dim = engref.target_dims[-1]
                     last_dim = engref.terminal.dimension
                     extend_children = self.children + ([self.children[-1]] * (last_dim - args))
                     return tf.stack(
@@ -291,10 +299,13 @@ class Node:
                 return engref.terminal.set[self.value]
         else:
             tens_list = []
+            if (self.value == 'lerp') and (dynamic_lerp is not None):
+                self.children[2].children = [dynamic_lerp]
             for c in self.children:
-                tens_list.append(c.get_tensor(engref))
+                tens_list.append(c.get_tensor(engref, dynamic_lerp))
 
             return self.node_tensor(tens_list, engref)
+
 
     def get_str(self):
         if self.terminal and self.value != 'scalar':
@@ -319,6 +330,7 @@ class Node:
 
             return string_to_use + ')'
 
+
     def get_depth(self, depth=0):
         n_childs = 1
         if self.terminal:
@@ -332,28 +344,47 @@ class Node:
                     max_d = child_depth
             return max_d, n_childs
 
-def constrain(n, a, b):
+
+## ====================== Utility methods ====================== ##
+
+def constrain(a, n, b):
     return min(max(n, a), b)
 
-def save_image(tensor, index, fn, dims, addon=''):
-    path = fn + addon + "_indiv" + str(index).zfill(5) + ".png"
-    # force output to 0...255
-    final_tensor = tf.math.subtract(tensor, tf.constant(_min_domain, tf.float32, dims))
-    final_tensor = tf.scalar_mul(255 / _domain_delta, final_tensor)
 
-    aux = np.array(tensor, dtype='uint8')
+# Map from codomain range to a specified final transform range
+def get_final_transform(tensor, ft_delta, ft_min):
+    return (tensor - _codomain[0]) * (ft_delta / _codomain_delta) + ft_min
+
+
+def get_np_array(tensor):
+    #check if tensor is in image range (0..255)
+    if ((not _do_final_transform) and _codomain[0] == 0.0 and _codomain[1] == 255.0) or (
+        _do_final_transform and _final_transform[0] == 0.0 and _final_transform[1] == 255.0):
+        tensor = get_final_transform(tensor, 255.0, 0.0)
+    return np.array(tensor, dtype='uint8')
+
+
+def save_image(tensor, index, fn, dims, sufix='', extension = "png", BGR = False): # expects [min_domain, max_domain]
+    
+    if extension not in ["png", "jpg", "jpeg"]:
+        extension = "png"
+    path = fn + "_ind" + str(index).zfill(5) + sufix + "." + extension
+    aux = get_np_array(tensor)
+
     try:
         if len(dims) == 2:
             Image.fromarray(aux, mode="L").save(path) # no color
         elif len(dims) == 3:
+            if BGR: aux = aux[:, :, ::-1]
             Image.fromarray(aux, mode="RGB").save(path) # color
         else:
             print("Attempting to save tensor with rank ", len(dims), " as an image, must be rank 2 (grayscale) or 3 (RGB).")
     except ValueError:
-        print()
+        print("[ERROR]:\tWrong rank in tensor")
     return path
 
-# just a wrapper for different expression types and strip preprocessing
+
+# Wrapper for different expression types and strip preprocessing
 def str_to_tree(stree, terminal_set, constrain_domain=True):
     return str_to_tree_normal(stree.replace(" ", "") + "", terminal_set, 0, constrain_domain)
 
@@ -362,14 +393,12 @@ def str_to_tree_normal(stree, terminal_set, number_nodes=0, constrain_domain = T
     if stree in terminal_set:
         return number_nodes, Node(value=stree, terminal=True, children=[])
     elif stree[:6] == 'scalar':
-        numbers = [(constrain(float(x), _min_domain, _max_domain) if constrain_domain else float(x)) for x in re.split('\(|\)|,', stree)[1:-1]]
-
+        numbers = [(constrain(_codomain[0], float(x), _codomain[1]) if constrain_domain else float(x)) for x in re.split('\(|\)|,', stree)[1:-1]]
+        #numbers = [float(x) for x in re.split('\(|\)|,', stree)[1:-1]]
         return number_nodes, Node(value='scalar', terminal=True, children=numbers)
     else:
         x = stree[:-1].split("(", 1)
-        #print("x:", x)
         primitive = x[0]
-        #print("x0:", x[0])
         if x[0][0] == '_':
             primitive = x[0][1::]
         args = x[1]
@@ -399,7 +428,7 @@ def set_device(device = '/gpu:0', debug_lvl = 1):
     cuda_build = tf.test.is_built_with_cuda()
     gpus_available = len(tf.config.list_physical_devices('GPU'))
 
-    # because these won't give an error but will be unspecified
+    # These won't give an error but will be unspecified
     if (device is None) or (device == '') or (device == ':'):
         device = '0'
     try:
@@ -423,61 +452,134 @@ def set_device(device = '/gpu:0', debug_lvl = 1):
     return result_device
 
 
+
 # TODO: should this be an inner class of Engine()?
 class Experiment:
 
-    def get_experiment_filename(self):
+    def set_experiment_filename(self, addon = None):
         date = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3]
-        return "run__" + date + "__" + str(self.ID)
+        prefix = addon if addon is not None else ""
+        return prefix + "__run__" + date + "__" + str(self.ID)
 
-    def set_generation_directory(self, generation):
+
+    def set_generation_directory(self, generation, can_save_image):
         try:
-            self.current_directory = self.working_directory + "generation_" + str(generation).zfill(5) + delimiter
-            #os.makedirs(self.current_directory)
+            self.cur_image_directory = self.all_directory + "generation_" + str(generation).zfill(5) + _tgp_delimiter
+            if can_save_image():
+                os.makedirs(self.cur_image_directory)
             #print("[DEBUG]:\tSet current directory to: " + self.current_directory)
-        except FileExistsError:
-            self.current_directory = self.working_directory
-            print("Could not create directory for generation" + str(generation) + " as it already exists")
+        except OSError as error:
+            if error is FileExistsError:
+                print(bcolors.WARNING + "[WARNING]:\tExperiment directory of generation " + str(generation) + " already exists, saving files to current directory.", bcolors.ENDC)
+            elif error is PermissionError:
+                print(bcolors.WARNING + "[WARNING]:\tPermission denied while creating directory of generation: " + str(generation) + ".", bcolors.ENDC)
+            else:
+                print(bcolors.WARNING + "[WARNING]:\tOSError while creating directory of generation: " + str(generation) + ".", bcolors.ENDC)
+            print(bcolors.WARNING + "[WARNING]:\tReverting current directory to general image directory.", bcolors.ENDC)
+            self.cur_image_directory = self.image_directory
+
 
     def set_experiment_ID(self):
         return int(time.time() * 1000.0) << 16
 
-    def __init__(self, file_state = None, seed = None, sub_wd = delimiter + subdir + delimiter, wd = None):
+
+    def __init__(self,
+                sub_wd = _tgp_delimiter + _tgp_subdir + _tgp_delimiter,
+                immigration = None,
+                file_state = None,
+                seed = None,
+                wd = None,
+                addon = None):
 
         self.ID = self.set_experiment_ID() if (file_state is None) else file_state['ID']
         self.seed = self.ID if (seed is None) else seed
-        self.filename = self.get_experiment_filename() + "__images"
+        self.filename = self.set_experiment_filename(addon=addon)
 
         try:
-            self.working_directory = (os.getcwd() + sub_wd + self.filename + delimiter) if wd is None else wd
+            self.working_directory = (os.getcwd() + sub_wd + self.filename + _tgp_delimiter) if wd is None else wd
             os.makedirs(self.working_directory)
-        except FileExistsError:
-            print(bcolors.WARNING + "[WARNING]:\tExperiment directory already exists, saving files to current directory." , bcolors.ENDC)
+        except OSError as error:
+            if error is FileExistsError:
+                print(bcolors.WARNING + "[WARNING]:\tExperiment directory already exists, saving files to current directory.", bcolors.ENDC)
+            elif error is PermissionError:
+                print(bcolors.WARNING + "[WARNING]:\tPermission denied while creating directory", bcolors.ENDC)
+            else:
+                print(bcolors.WARNING + "[WARNING]:\tOSError while creating directory", bcolors.ENDC)
             print(bcolors.WARNING + "[WARNING]:\tFilename: " + self.working_directory , bcolors.ENDC)
-            self.working_directory = ''
+            self.working_directory = os.getcwd()
 
+        # New Filesystem
         self.current_directory = self.working_directory
-        self.generations_directory = self.working_directory + "generations" + delimiter
-        self.immigration_directory = self.generations_directory + "immigration" + delimiter
-        self.logging_diredctory = self.working_directory + "logs" + delimiter
-        print("Log dir: ", self.logging_diredctory)
-        self.best_directory = self.working_directory + "best" + delimiter
+        self.image_directory = self.working_directory + "images" + _tgp_delimiter
+        self.cur_image_directory = self.image_directory
+        self.bests_directory = self.image_directory + "bests" + _tgp_delimiter
+        self.all_directory = self.image_directory + "all" + _tgp_delimiter
+        # TODO: transform immigration into archive
+        self.immigration_directory = (self.image_directory + "immigration" + _tgp_delimiter) if immigration is not None else os.getcwd()
+        self.logging_directory = self.working_directory + "logs" + _tgp_delimiter
+        self.generations_directory = self.logging_directory + "generations" + _tgp_delimiter
+        self.graphs_directory = self.working_directory
         try:
-            os.makedirs(self.generations_directory)
-            os.makedirs(self.immigration_directory)
-            os.makedirs(self.logging_diredctory)
-            os.makedirs(self.best_directory)
-        except FileExistsError:
-            print(bcolors.WARNING + "[WARNING]:\tTried to create a directory that already exists" , bcolors.ENDC)
+            os.makedirs(self.current_directory, exist_ok = True)
+            os.makedirs(self.image_directory, exist_ok = True)
+            os.makedirs(self.cur_image_directory, exist_ok = True)
+            os.makedirs(self.bests_directory, exist_ok = True)
+            os.makedirs(self.all_directory, exist_ok = True)
+            if immigration is not None: os.makedirs(self.immigration_directory)  
+            os.makedirs(self.logging_directory, exist_ok = True)
+            os.makedirs(self.generations_directory, exist_ok = True)
+            os.makedirs(self.graphs_directory, exist_ok = True)
+
+        except OSError as error:
+            if error is PermissionError:
+                print(bcolors.WARNING + "[WARNING]:\tPermission denied while creating experiment subdirectories.", bcolors.ENDC)
+            else:
+                print(bcolors.WARNING + "[WARNING]:\tOSError while creating experiment subdirectories.", bcolors.ENDC)
+
+        overall_extension = "csv"
+        overall_suffix = str(self.filename) + "." + overall_extension
+        self.overall_fp = self.working_directory + "evolution_" + overall_suffix
+        self.timings_fp = self.logging_directory + "timings_" + overall_suffix
+        self.setup_fp = self.working_directory + "seput.txt"
+        self.bests_fp = self.logging_directory + "bests.csv"
+        self.bests_overall_fp = self.logging_directory + "bests_overall.csv"
+
+
+
+
+## ====================== Methods of an individual ====================== ##
+
+def has_illegal_parents(tree):
+    for p in tree['parents']:
+        if not p['valid']:
+            return False
+    return True
+
+
+def get_largest_parent(tree, depth = True):
+    sizep = -1
+    for p in tree['parents']:
+        tsize = p['depth'] if depth else p['nodes']
+        sizep = max(sizep, tsize)
+    return sizep
+
+
+# NOTE: Placeholder for weights for later implementation with Adam Optimmizer
+def new_individual(tree, fitness = 0, depth = 0, nodes = 0, tensor = [], valid = True, parents = [], weights = []):
+    return {'tree': tree, 'fitness': fitness, 'depth': depth, 'nodes': nodes, 'tensor': tensor, 'valid': valid, 'parents': parents, 'weights': weights}
+
+
+
+## ====================== Engine ====================== ##
 
 class Engine:
 
-    ## ====================== genetic operators ====================== ##
 
+    ## ====================== genetic operators ====================== ##
     def crossover(self, parent_1, parent_2):
         crossover_node = None
 
-        if self.engine_rng.random() < self.koza_rule_prob and not parent_1.terminal:  # TODO: review, this is Koza's rule
+        if self.engine_rng.random() < self.koza_rule_prob and not parent_1.terminal:
             # function crossover
             parent_1_candidates = self.list_nodes(parent_1, True, add_funcs=True, add_terms=False, add_root=True)
             parent_1_chosen_node, _ = self.engine_rng.choice(parent_1_candidates)
@@ -491,10 +593,7 @@ class Engine:
                 crossover_node = copy.deepcopy(parent_1_chosen_node)
         else:
             parent_1_terminals = self.get_terminals(parent_1)
-            #print("size of crossover node list: ", len(list(parent_1_terminals.elements())))
             crossover_node = copy.deepcopy(self.engine_rng.choice(list(parent_1_terminals.elements())))
-
-        #print("Crossover node in parent 1: ", crossover_node.get_str())
 
         if crossover_node is None:
             print("[ERROR]: Did not select a crossover node.")
@@ -503,7 +602,6 @@ class Engine:
 
         if len(parent_2_candidates) > 0:
             parent_2_chosen_node, _ = self.engine_rng.choice(parent_2_candidates)
-            # second part of if, because in future there can be funcs with no arguments
             if not parent_2_chosen_node.terminal and len(parent_2_chosen_node.children) > 0:
                 rand_child = self.engine_rng.randint(0, len(parent_2_chosen_node.children) - 1)
                 parent_2_chosen_node.children[rand_child] = crossover_node
@@ -512,9 +610,8 @@ class Engine:
         else:
             new_individual = crossover_node
 
-        #print("Indiv cross: ", new_individual.get_str())
-
         return new_individual
+
 
     def get_candidates(self, node, root):
         candidates = Counter()
@@ -526,6 +623,7 @@ class Engine:
         if root and candidates == Counter():
             candidates.update([node])
         return candidates
+
 
     def tournament_selection(self):
         if self.objective == 'minimizing':
@@ -542,6 +640,7 @@ class Engine:
                     winner = i
         return winner
 
+
     def mutation(self, parent):
         random_n = self.engine_rng.random()
         for k in range(len(self.mutation_funcs) - 1, -1, -1):
@@ -552,27 +651,14 @@ class Engine:
                     return self.mutation_funcs[k](parent)
 
 
-    def old_random_terminal(self):
-        _l = []
-        if self.engine_rng.random() < self.scalar_prob:
-            _v = 'scalar'
-
-            #color
-            if self.engine_rng.random() < self.uniform_scalar_prob:
-                _l = [self.engine_rng.uniform(self.erc_min, self.erc_max)] * self.terminal.dimension
-            else:
-                _l = [self.engine_rng.uniform(self.erc_min, self.erc_max) for i in range(self.terminal.dimension)]
-
-        else:
-            _v = self.engine_rng.sample(list(self.terminal.set), 1)[0]
-        return Node(terminal = True, children = _l, value = _v)
-
     def random_terminal(self):
         _, node = self.generate_program(method='full', max_nodes = 0, max_depth = 0)
         return node
 
+
     def copy_node(self, n):
         return Node(value=n.value, terminal=n.terminal, children=n.children)
+
 
     def delete_mutation(self, parent):
         new_individual = copy.deepcopy(parent)
@@ -603,8 +689,8 @@ class Engine:
             chosen_node, _ = self.engine_rng.choice(candidates)
             #print(new_individual.get_str())
 
-            #insert node between choosen and choosen's child
-            #random child of chosen
+            # Insert node between choosen and choosen's child
+            # random child of chosen
             # second part of if, because in future there can be funcs with no arguments
             if not chosen_node.terminal and len(chosen_node.children) > 0:
                 chosen_child = chosen_node.children[self.engine_rng.randint(0, len(chosen_node.children) - 1)]
@@ -632,6 +718,7 @@ class Engine:
                 chosen_child.children.append(self.random_terminal())
         return new_individual
 
+
     def list_nodes(self, node, dep=0, root=False, add_funcs=True, add_terms=True, add_root=False):
         res = []
         if (node.terminal and (add_terms or (root and add_root))) or ((not node.terminal) and add_funcs and ((not root) or add_root)):
@@ -641,7 +728,8 @@ class Engine:
                 res += self.list_nodes(c, dep + 1, False, add_funcs, add_terms, add_root)
         return res
 
-    # this is the same , except it does not go back to the loop
+
+    # This is the same , except it does not go back to the loop
     def hacky_subtree_mutation(self, parent):
         new_individual = copy.deepcopy(parent)
         #print("\nindiv, ", new_individual.get_str())
@@ -660,6 +748,7 @@ class Engine:
             new_individual = mutation_node
         return new_individual
 
+
     def subtree_mutation(self, parent):
         new_individual = copy.deepcopy(parent)
         # candidates = self.get_candidates(new_individual, True)
@@ -675,6 +764,8 @@ class Engine:
             new_individual = mutation_node
         return new_individual
 
+
+    # TODO: Support for genetic operators per node
     def replace_nodes(self, node):
         if node.terminal:
             if self.engine_rng.random() < self.scalar_prob:
@@ -722,6 +813,7 @@ class Engine:
         self.replace_nodes(chosen_node)
         return new_individual
 
+
     def get_terminals(self, node):
         candidates = Counter()
         if node.terminal:
@@ -732,7 +824,8 @@ class Engine:
                     candidates.update(self.get_terminals(i))
         return candidates
 
-    ## ====================== init class ====================== ##
+
+    ## ====================== Init class ====================== ##
 
     def __init__(self,
                  fitness_func = None,
@@ -760,7 +853,12 @@ class Engine:
                  objective = 'minimizing',
                  min_domain = -1,
                  max_domain = 1,
+                 codomain = None,
+                 final_transform = None,
+                 do_final_transform = False,
                  bloat_control = 'std',
+                 bloat_mode = 'depth',
+                 dynamic_limit = 8,
                  domain_mode = 'dynamic',
                  replace_mode = 'dynamic_arities',
                  replace_prob = 0.05,
@@ -778,13 +876,19 @@ class Engine:
                  minimal_print = False,
                  save_graphics = True,
                  show_graphics = True,
-                 save_best = True,
-                 device = '/cpu:0',
+                 
+                 save_image_best = True,
+                 save_image_pop = True,
                  save_to_file = 10,
+                 save_to_file_image = None,
+                 save_to_file_log = None,
+                 save_bests = True,
+                 save_bests_overall = True,
+
+                 device = '/cpu:0',
+                 do_bgr = False,
                  write_log = True,
                  write_gen_stats = True,
-                 write_final_pop = False,
-                 path_to_final_pop = None,
                  initial_test_device = True,
                  file_state = None,
                  var_func = None,
@@ -805,6 +909,8 @@ class Engine:
         # check for fitness func
         self.fitness_func = fitness_func
 
+        # TODO: read configuration if present
+
         # optional vars
         self.recent_fitness_time = 0
         self.recent_tensor_time = 0
@@ -818,16 +924,19 @@ class Engine:
         self.stop_criteria = stop_criteria
         self.save_graphics = save_graphics
         self.show_graphics = show_graphics
+        self.do_bgr = do_bgr
         if bloat_control not in ['full_dynamic_dep', 'dynamic_dep']: # add full_dynamic_size, dynamic_size
             bloat_control = 'off'
         self.bloat_control = bloat_control
+        self.bloat_mode = 'size' if bloat_mode == 'size' else 'depth'
         if domain_mode not in ['log', 'dynamic', 'mod']: # add full_dynamic_size, dynamic_size
             domain_mode = 'clip'
         self.domain_mode = domain_mode
         self.immigration = immigration
         self.debug = debug
         self.minial_print = minimal_print
-        self.save_to_file = save_to_file
+        self.save_to_file_image = save_to_file if save_to_file_image is None else save_to_file_image
+        self.save_to_file_log = save_to_file if save_to_file_log is None else save_to_file_log
         self.max_nodes = max_nodes
         self.objective = objective
         self.terminal_prob = terminal_prob
@@ -850,6 +959,8 @@ class Engine:
         self.max_subtree_dep = self.max_tree_depth if (max_subtree_dep is None) else max_subtree_dep
         self.min_subtree_dep = self.min_tree_depth if (min_subtree_dep is None) else min_subtree_dep
         if self.max_subtree_dep < self.min_subtree_dep: self.max_subtree_dep, self.min_subtree_dep = self.min_subtree_dep, self.max_subtree_dep
+        self.dynamic_limit = max(dynamic_limit, self.max_subtree_dep)
+        self.initial_dynamic_limit = self.dynamic_limit
 
         self.stats_file_path = stats_file_path
         self.graphics_file_path = graphics_file_path
@@ -862,20 +973,19 @@ class Engine:
         self.file_state = file_state
         self.experiment = Experiment(seed=seed, wd=self.run_dir_path)
         self.engine_rng = random.Random(self.experiment.seed)
+        tf.random.set_seed(self.experiment.seed)
         self.method = method if (method in ['ramped half-and-half', 'grow', 'full']) else 'ramped half-and-half'
         self.replace_mode = replace_mode if replace_mode == 'dynamic_arities' else 'same_arity'
         self.replace_prob = max(0.0, min(1.0, replace_prob))
         self.pop_file = read_init_pop_from_file
         self.write_log = write_log
         self.write_gen_stats = write_gen_stats
-        self.write_final_pop = write_final_pop
-        self.save_best = save_best
-        self.path_to_final_pop = self.experiment.current_directory if path_to_final_pop is None else path_to_final_pop
-        #self.overall_stats_filename = 'overall_stats.csv'
+        self.save_image_best = save_image_best
+        self.save_bests = save_bests
+        self.save_bests_overall = save_bests_overall
+        self.save_image_pop = save_image_pop
         self.save_state = 0
         self.last_stop = 0
-        self.overall_stats_filename = "tensorgp_" + str(self.target_dims[0]) + "_" + str(self.experiment.seed) + '.csv'
-
 
         if mutation_funcs is None or mutation_funcs == []:
             mut_funcs_implemented = 4
@@ -896,11 +1006,23 @@ class Engine:
 
         # technically globals are not needed but it helps with external operators
         global _domain_delta, _min_domain, _max_domain
+        global _codomain_delta, _codomain, _final_transform, _final_transform_delta, _do_final_transform
         if min_domain is not None:
             _min_domain = min_domain
         if max_domain is not None:
             _max_domain = max_domain
         _domain_delta = max_domain - min_domain
+        if (codomain is not None) and isinstance(codomain, list):
+            _codomain = [float(codomain[0]), float(codomain[1])]
+        _codomain_delta = _codomain[1] - _codomain[0]
+        
+        self.do_final_transform = do_final_transform
+        _do_final_transform = self.do_final_transform
+        if self.do_final_transform:
+            if (final_transform is not None) and isinstance(final_transform, list):
+                _final_transform = [float(final_transform[0]), float(final_transform[1])]
+            _final_transform_delta = _final_transform[1] - _final_transform[0]
+
 
         if const_range is None or len(const_range) < 1:
             self.erc_min = _min_domain
@@ -922,20 +1044,17 @@ class Engine:
             else:
                 self.var_func = var_func
             self.terminal = Terminal_Set(self.effective_dims, self.target_dims, engref=self, function_ptr_to_var_node=self.var_func)
-
-
+        
         #print("x tensor: ", self.terminal.set['x'])
         #print("y tensor: ", self.terminal.set['y'])
 
-
         if isinstance(target, str):
-            target = 'mult(scalar(127.5), ' + target + ')'
+            # target = 'mult(scalar(127.5), ' + target + ')'
             _, tree = str_to_tree(target, self.terminal.set, constrain_domain=False)
 
             with tf.device(self.device):
-                #self.target = self.final_transform_domain(tree.get_tensor(self))
-                self.target = tf.cast(tree.get_tensor(self), tf.float32) # cast to an int tensor
-                #self.target = pagie_poly(self.terminal.set, self.target_dims)
+                self.target = tf.cast(get_final_transform(tree.get_tensor(self), _final_transform_delta, _final_transform[0]), tf.float32) # cast to an int tensor
+                # self.target = tf.cast(tree.get_tensor(self) * 127.5, tf.float32) # cast to an int tensor
         else:
             self.target = target
 
@@ -945,9 +1064,11 @@ class Engine:
         # fitness - stop evolution if best individual is close enought to target (or given value)
         # generation - stop evolution after a given number of generations
         if self.objective == 'minimizing':
-            self.objective_condition = lambda x: (x < self.best_overall['fitness'])
+            self.condition_overall = lambda x: (x < self.best_overall['fitness'])
+            self.condition_local = lambda x: (x < self.best['fitness'])
         else:
-            self.objective_condition = lambda x: (x > self.best_overall['fitness'])
+            self.condition_overall = lambda x: (x > self.best_overall['fitness'])
+            self.condition_local = lambda x: (x > self.best['fitness'])
 
         if stop_criteria == 'fitness':  # if fitness then stop value means error
             self.stop_value = stop_value
@@ -955,28 +1076,40 @@ class Engine:
                 self.condition = lambda: (self.best > self.stop_value)
             else:
                 self.condition = lambda: (self.best < self.stop_value)
+            self.next_condition = self.condition
         else: # if generations then stop_value menas number of generations to evaluate
             self.stop_value = int(stop_value)
             self.condition = lambda: (self.current_generation <= self.stop_value)
+            self.next_condition = lambda:  (self.current_generation + 1 <= self.stop_value)
 
         # update timers
         self.elapsed_init_time += time.time() - start_init
         if self.debug > 0 and not self.minial_print: print("Elapsed init time: ", self.elapsed_init_time)
-        print(bcolors.OKGREEN + "Engine seed:", self.experiment.seed, bcolors.ENDC)
+        print(bcolors.OKGREEN + "Engine seed:" + str(self.experiment.seed), bcolors.ENDC)
         self.update_engine_time()
 
         self.population = []
-        #self.tensors = []
         self.best = {}
         self.best_overall = {}
+
+
+    def can_save_image(self):
+        return ((self.current_generation % self.save_to_file_image) == 0) or not self.next_condition()
+
+
+    def can_save_log(self):
+        return ((self.current_generation % self.save_to_file_log) == 0) or not self.next_condition()
+
 
     def restart(self, new_stop = 10):
         self.last_stop = self.stop_value
         self.stop_value = self.stop_value + new_stop
 
+
     def generate_program(self, method, max_nodes, max_depth, min_depth = -1, root=True):
         terminal = False
         children = []
+        #print(max_depth)
 
         # set primitive node
         # (max_depth * max_nodes) == 0 means if we either achieved maximum depth ( = 0) or there are no more
@@ -999,7 +1132,12 @@ class Engine:
                 else:
                     children = [self.engine_rng.uniform(self.erc_min, self.erc_max) for i in range(self.terminal.dimension)]
             else:
-                primitive = self.engine_rng.choice(list(self.terminal.set)) # TODO: what is this???
+                #print("Lets print the current terminal set list:")
+                #print(list(self.terminal.set))
+                #print("")
+                
+                primitive = self.engine_rng.choice(list(self.terminal.set))
+
             terminal = True
         else:
             primitive = self.engine_rng.choice(list(self.function.set))
@@ -1013,18 +1151,17 @@ class Engine:
 
         return max_nodes, Node(value=primitive, terminal=terminal, children=children)
 
+
     def generate_population(self, individuals, method, max_nodes, max_depth, min_depth = -1):
-        if max_depth < 2:
-            if max_depth <= 0:
-                return 0, []
-            #if max_depth == 1:
-            #    method = 'full'
+        # print("Entering generate program (min, max)", min_depth, max_depth)
+
+        if max_depth <= min_depth:
+            max_depth, min_depth = min_depth, max_depth
 
         population = []
         pop_nodes = 0
 
-
-        if method == 'full' or method == 'grow':
+        if not ((method == 'ramped half-and-half') and (max_depth >= 1)):
             for i in range(individuals):
 
                 # TODO: why was this without min_depth? TEST
@@ -1033,14 +1170,15 @@ class Engine:
                 tree_nodes = (max_nodes - _n)
                 pop_nodes += tree_nodes
                 dep, nod = t.get_depth()
-                population.append({'tree': t, 'fitness': 0, 'depth': dep, 'nodes': nod, 'tensor': []})
+                #population.append({'tree': t, 'fitness': 0, 'depth': dep, 'nodes': nod, 'tensor': [], 'valid': True, 'parents':[]})
+                population.append(new_individual(t, fitness=0, depth=dep, nodes=nod))
         else:
             # -1 means no minimun depth, but the ramped 5050 default should be 2 levels
-            #_min_depth = 2 if (min_depth <= 0) else min_depth  # TODO: (commented)
-            _min_depth = min_depth
+            _min_depth = 0 if (min_depth <= -1) else min_depth
 
 
-            divisions = max_depth - (_min_depth - 1)
+            # divisions = max_depth - (_min_depth - 1)
+            divisions = max_depth - (_min_depth) + 1
             parts = math.floor(individuals / divisions)
             last_part = individuals - (divisions - 1) * parts
             #load_balance_index = (max_depth - 1) - (last_part - parts)
@@ -1049,7 +1187,10 @@ class Engine:
 
             num_parts = parts
             mfull = math.floor(num_parts / 2)
+
+            #print("generate program (min, max)", _min_depth, max_depth + 1)
             for i in range(_min_depth, max_depth + 1):
+                #print("This is i", i)
 
                 # TODO: shouldn't i - 2 be i - min_depth? TEST or just i
                 #if i - 2 == load_balance_index:
@@ -1062,52 +1203,75 @@ class Engine:
 
                     if j >= mfull:
                         met = 'grow'
-                    #print("i: ", i, "min dep: ", min_depth)
+                    #print("i: ", i, "min dep: ", _min_depth)
 
                     _n, t = self.generate_program(met, max_nodes, i, min_depth = min_depth)
                     tree_nodes = (max_nodes - _n)
                     #print("Tree nodes: " + str(tree_nodes))
                     pop_nodes += tree_nodes
                     dep, nod = t.get_depth()
-                    population.append({'tree': t, 'fitness': 0, 'depth': dep, 'nodes': nod, 'tensor': []})
+                    #population.append({'tree': t, 'fitness': 0, 'depth': dep, 'nodes': nod, 'tensor': [], 'valid': True, 'parents':[]})
+                    population.append(new_individual(t, fitness=0, depth=dep, nodes=nod))
 
         if len(population) != individuals:
             print(bcolors.FAIL + "[ERROR]:\tWrong number of individuals generated: " + str(len(population)) + "/" + str(individuals) , bcolors.ENDC)
 
         return pop_nodes, population
 
-    def domain_range(self, final_tensor):
+
+    def codomain_range(self, final_tensor):
+        # 'dynamic' and 'mod' modes normmalize to 0..1
         if self.domain_mode == 'log':
-            final_tensor = tf.math.log(tf.math.abs(final_tensor))
+            final_tensor = tf.math.log(tf.math.abs(final_tensor)) / tf.math.log(tf.constant(10.0, dtype=tf.float32))
         elif self.domain_mode == 'dynamic':
-            #final_tensor = tf.math.abs(final_tensor) # TODO: between 0,+inf -> 0,1
-            final_tensor = (final_tensor / (1 + final_tensor)) * _domain_delta + _min_domain
+            final_tensor = tf.math.abs(final_tensor)
+            final_tensor = (final_tensor / (1 + final_tensor))
         elif self.domain_mode == 'mod':
-            final_tensor = tf.math.floormod(final_tensor, _domain_delta) + _min_domain
-        return tf.clip_by_value(final_tensor, clip_value_min=_min_domain, clip_value_max=_max_domain)
+            final_tensor = tf.math.abs(final_tensor)
+            final_tensor = final_tensor - tf.math.floor(final_tensor)
+        return tf.clip_by_value(final_tensor, clip_value_min=_codomain[0], clip_value_max=_codomain[1])
 
-    #@tf.function
-    def final_transform_domain(self, final_tensor):
-        #global _min_domain, _max_domain, _domain_delta
-        final_tensor = tf.where(tf.math.is_nan(final_tensor), 0.0, final_tensor)
-        final_tensor = self.domain_range(final_tensor)
 
-        #final_tensor = tf.cast(final_tensor, tf.uint8)
+    def domain_mapping(self, tensor):
+        final_tensor = tf.where(tf.math.is_nan(tensor), 0.0, tensor)
+        final_tensor = tf.clip_by_value(final_tensor, clip_value_min=tf.float32.min, clip_value_max=tf.float32.max)
+        final_tensor = self.codomain_range(final_tensor)
+        if self.do_final_transform:
+            final_tensor = get_final_transform(final_tensor, _final_transform_delta, _final_transform[0])
         return final_tensor
 
+
+    def final_transform_domain(self, final_tensor):
+        return final_tensor
+
+
     def calculate_tensors(self, population):
+        tensors = []
+        #with tf.device(self.device):
         start = time.time()
 
         for p in population:
+
+            #print("Evaluating ind: ", p['tree'].get_str())
+            #_start = time.time()
             test_tens = p['tree'].get_tensor(self)
-            p['tensor'] = self.final_transform_domain(test_tens)
-            #print(p['tensor'])
+            # tens = self.final_transform_domain(test_tens)
+            tens = self.domain_mapping(test_tens)
+            #tens = test_tens
+            p['tensor'] = tens
+            tensors.append(tens)
+
+            #dur = time.time() - _start
+            #print("Took", dur, "s")
+
 
         time_tensor = time.time() - start
 
         self.elapsed_tensor_time += time_tensor
         self.recent_tensor_time = time_tensor
-        return time_tensor
+        return tensors, time_tensor
+
+
 
     def fitness_func_wrap(self, population, f_path):
 
@@ -1115,7 +1279,7 @@ class Engine:
 
         if self.debug > 4: print("\nEvaluating generation: " + str(self.current_generation))
         with tf.device(self.device):
-            time_taken = self.calculate_tensors(population)
+            tensors, time_taken = self.calculate_tensors(population)
         if self.debug > 4: print("Calculated " + str(len(population)) + " tensors in (s): " + str(time_taken))
 
         # calculate fitness
@@ -1127,30 +1291,36 @@ class Engine:
 
         population, best_ind = self.fitness_func(generation = self.current_generation,
                                                  population = population,
-                                                 #tensors = tensors,
+                                                 tensors = tensors,
                                                  f_path = f_path,
                                                  rng = self.engine_rng,
                                                  objective = self.objective,
                                                  resolution = self.target_dims,
-                                                 stf = self.save_to_file,
+                                                 stf = self.save_to_file_image,
                                                  target = self.target,
                                                  dim = self.dimensionality,
                                                  best_o = self.best_overall,
                                                  debug = False if (self.debug == 0) else True)
         fitness_time = time.time() - _s
 
+        if self.can_save_image():
+            # Save Best Image
+            if self.save_image_best:
+                fn = self.experiment.bests_directory + "best_gen" + str(self.current_generation).zfill(5)
+                save_image(population[best_ind]['tensor'], best_ind, fn, self.target_dims, BGR = self.do_bgr)
 
-        # save best
-        if self.save_best:
-            fn = self.experiment.best_directory + "best_gen" + str(self.current_generation).zfill(5) + "_"
-            save_image(population[best_ind]['tensor'], best_ind, fn, self.target_dims, addon='_best')
-
+            # Save Population Images
+            if self.save_image_pop:
+                for i in range(len(population)):
+                    fn = self.experiment.cur_image_directory + "gen" + str(self.current_generation).zfill(5)
+                    save_image(population[i]['tensor'], i, fn, self.target_dims, BGR = self.do_bgr)
 
         self.elapsed_fitness_time += fitness_time
         self.recent_fitness_time = fitness_time
         if self.debug > 4: print("Assessed " + str(len(population)) + " fitness tensors in (s): " + str(fitness_time))
 
         return population, population[best_ind]
+
 
     def generate_pop_from_expr(self, strs):
         population = []
@@ -1164,7 +1334,8 @@ class Engine:
             if thisdep > maxpopd:
                 maxpopd = thisdep
 
-            population.append({'tree': node, 'fitness': 0, 'depth': thisdep, 'nodes': t, 'tensor': []})
+            #population.append({'tree': node, 'fitness': 0, 'depth': thisdep, 'nodes': t, 'tensor': [], 'valid': True, 'parents':[]})
+            population.append(new_individual(node, fitness=0, depth=thisdep, nodes=t))
             if self.debug > 0:
                 print("Number of nodes:\t:" + str(t))
                 print(node.get_str())
@@ -1179,12 +1350,11 @@ class Engine:
         # open population files
         strs = []
         with open(read_from_file) as fp:
-            line = fp.readline()
+            line = fp.readline().replace("\n", "")
             cnt = 0
             while line and cnt < pop_size:
-                #line = line[:-1]
                 strs.append(line)
-                line = fp.readline()
+                line = fp.readline().replace("\n", "")
                 cnt += 1
             if cnt < pop_size < float('inf'):
                 print(bcolors.WARNING + "[WARNING]:\tCould only read " + str(cnt) + " expressions from population file " +
@@ -1193,9 +1363,8 @@ class Engine:
         # convert expressions to trees
         return self.generate_pop_from_expr(strs)
 
-    def initialize_population(self, max_depth, min_depth, individuals, method, max_nodes, immigration = False, read_from_file = None):
-        #generate trees
 
+    def initialize_population(self, max_depth, min_depth, individuals, method, max_nodes, read_from_file = None):
         start_init_population = time.time()
 
         if read_from_file is None:
@@ -1223,13 +1392,11 @@ class Engine:
 
         tree_generation_time = time.time() - start_init_population
 
-        if self.debug > 0: # 1
+        if self.debug > 1:
             print("Generated Population: ")
             self.print_population(population)
 
-        #calculate fitness
-        f_fitness_path = self.experiment.immigration_directory if immigration else self.experiment.current_directory
-        population, best_pop = self.fitness_func_wrap(population=population, f_path=f_fitness_path)
+        population, best_pop = self.fitness_func_wrap(population=population, f_path=self.experiment.cur_image_directory)
 
         total_time = self.recent_fitness_time + self.recent_tensor_time
 
@@ -1250,10 +1417,10 @@ class Engine:
 
 
     def write_pop_to_csv(self, fp = None):
-        if self.write_gen_stats:
-            genstr = "gen_" + str(self.current_generation).zfill(5)
-            fn = self.experiment.logging_diredctory if fp is None else fp
-            fn += genstr + "_stats.csv"
+        if self.write_gen_stats and self.can_save_log():
+            genstr = "gen" + str(self.current_generation).zfill(5)
+            fn = self.experiment.generations_directory if fp is None else fp
+            fn += genstr + ".csv"
             with open(fn, mode='w', newline='') as file:
                 fwriter = csv.writer(file, delimiter=',')
                 ind = 0
@@ -1279,6 +1446,7 @@ class Engine:
             res[k] = [_avg, _std, _best, _best_all]
         return res
 
+
     def generate_pop_images(self, expressions, fpath = None):
         fp = self.experiment.current_directory if fpath is None else fpath
         #tensors = []
@@ -1299,8 +1467,19 @@ class Engine:
         index = 0
         for p in pop:
             t = p['tensor']
-            save_image(t, index, fp, self.target_dims)
+            save_image(t, index, fp, self.target_dims, BGR = self.do_bgr)
             index += 1
+
+    # and ((node_p1.value != 'scalar') or (node_p1.children == node_p2.children)):
+
+    def generate_aligned(self, node_p1, node_p2):
+        if (node_p1.value != 'scalar') and (node_p1.value == node_p2.value):
+            children = [self.generate_aligned(c1, c2) for c1, c2 in zip(node_p1.children, node_p2.children)]
+            return Node(node_p1.value, children, node_p1.terminal)
+        else:
+            children = [copy.deepcopy(node_p1), copy.deepcopy(node_p2), Node('scalar', [0.0], True)]
+            return Node('lerp', children, False)
+
 
     def run(self, stop_value = 10, start_from_last_pop = True):
 
@@ -1310,7 +1489,7 @@ class Engine:
         if self.save_state > 0:
             self.restart(stop_value)
 
-        if self.fitness_func is None:
+        if self.fitness_func is None and ((self.pop_file is None) or (self.stop_value > 0)):
             print(bcolors.FAIL + "[ERROR]:\tFitness function must be defined to run evolutionary process." , bcolors.ENDC)
             return
 
@@ -1327,7 +1506,7 @@ class Engine:
             self.current_generation = self.file_state['generations']
             self.experiment.seed += self.current_generation
 
-            self.experiment.set_generation_directory(self.current_generation)
+            self.experiment.set_generation_directory(self.current_generation, self.can_save_image)
 
             # time counters
             self.elapsed_init_time = self.file_state['elapsed_init_time']
@@ -1341,15 +1520,14 @@ class Engine:
 
         else:
             if start_from_last_pop < self.population_size or self.save_state == 0:
-                self.experiment.set_generation_directory(self.current_generation)
+                self.experiment.set_generation_directory(self.current_generation, self.can_save_image)
 
                 population, best = self.initialize_population(self.max_init_depth,
-                                                                      self.min_init_depth,
-                                                                      self.population_size - start_from_last_pop,
-                                                                      self.method,
-                                                                      self.max_nodes,
-                                                                      immigration=False,
-                                                                      read_from_file=self.pop_file)
+                                                              self.min_init_depth,
+                                                              self.population_size - start_from_last_pop,
+                                                              self.method,
+                                                              self.max_nodes,
+                                                              read_from_file=self.pop_file)
 
                 if start_from_last_pop > 0:
                     if self.objective == 'minimizing':
@@ -1366,9 +1544,12 @@ class Engine:
                 self.best = best
                 self.best_overall = copy.deepcopy(self.best)
 
+                # Print Initial Population
+                # self.print_population(population, False)
+
                 # write first gen data
                 self.write_pop_to_csv(self.pop_file_path)
-                self.save_state_to_file(self.experiment.logging_diredctory)
+                self.save_bests_log()
                 if self.debug > 2:
                     self.print_engine_state(force_print=True)
 
@@ -1384,8 +1565,11 @@ class Engine:
                     print(bcolors.BOLD + bcolors.OKCYAN +   "[  gen  |    avg    ,    std    , best(gen) , best(all) |    avg    ,    std    , best(gen) , best(all) |    avg    ,    std    , best(gen) , best(all) | generation,  fit eval ,tensor eval]\n" , bcolors.ENDC)
                 print(bcolors.OKBLUE + "[%7d, %10.6f, %10.6f, %10.6f, %10.6f, %10.3f, %10.6f, %10d, %10d, %10.3f, %10.6f, %10d, %10d, %10.6f, %10.6f, %10.6f]"%tuple(self.data[-1]) , bcolors.ENDC)
 
-
                 self.current_generation += 1
+
+        # Save engine state to file
+        self.save_engine_state()
+
 
         while self.condition():
 
@@ -1393,107 +1577,119 @@ class Engine:
             self.engine_rng = random.Random(self.experiment.seed)
 
             # Set directory to save engine state in this generation
-            self.experiment.set_generation_directory(self.current_generation)
+            self.experiment.set_generation_directory(self.current_generation, self.can_save_image)
 
-            # immigrate individuals
-            if self.current_generation % self.immigration == 0:
-                immigrants, _ = self.initialize_population(self.max_init_depth,
-                                                              self.min_init_depth,
-                                                              self.population_size,
-                                                              self.method,
-                                                              self.max_nodes,
-                                                              immigration = True, read_from_file = None)
+            # TODO: immigrate individuals (archive)
 
-                self.population.extend(immigrants)
-                self.population = self.engine_rng.sample(self.population, self.population_size)
-
-            # create new population of individuals
+            # Create new population of individuals
             if self.objective == 'minimizing':
                 new_population = nsmallest(self.elitism, self.population, key=itemgetter('fitness'))
             else:
                 new_population = nlargest(self.elitism, self.population, key=itemgetter('fitness'))
 
-            # TODO: this is to monitor number of retries, it will be changed
+            temp_population = []
             retrie_cnt = []
-
-            # for each individual, build new population
             for current_individual in range(self.population_size - self.elitism):
 
-                member_depth = float('inf')
-
-                # generate new individual with acceptable depth
-
-                rcnt = self.max_retries
-                #while member_depth > self.max_tree_depth:
-                while rcnt != 0 and member_depth > self.max_tree_depth:
-
-                    parent = self.tournament_selection()
-                    #random_n = self.engine_rng.random()
-                    indiv_temp = parent['tree']
-                    random_n1 = self.engine_rng.random()
-                    random_n2 = self.engine_rng.random()
-                    if random_n1 < self.crossover_rate:
-                        parent_2 = self.tournament_selection()
-                        indiv_temp = self.crossover(parent['tree'], parent_2['tree'])
-                        #print("cross")
-                    if random_n2 < self.mutation_rate:
-                        indiv_temp = self.mutation(parent['tree'])
-                    if random_n1 >= self.crossover_rate and random_n1 >= self.crossover_rate:
-                        indiv_temp = parent['tree']
-
-
-                    #elif (random_n >= self.crossover_rate) and (random_n < self.crossover_rate + self.mutation_rate):
-                    #print("mut")
-                    #else:
-                    #    indiv_temp = parent['tree']
-
+                rcnt = 0
+                if self.bloat_control == "off":
+                    member_depth = float('inf')
+                    while member_depth > self.max_tree_depth and rcnt < self.max_retries:
+                        indiv_temp, plist = self.selection()
+                        member_depth, member_nodes = indiv_temp.get_depth()
+                        rcnt += 1
+                    retrie_cnt.append(rcnt)
+                else:
+                    indiv_temp, plist = self.selection()
                     member_depth, member_nodes = indiv_temp.get_depth()
-                    #print("Eval ind: ", indiv_temp.get_str())
+                temp_population.append(new_individual(indiv_temp, fitness=0, depth=member_depth, nodes=member_nodes, valid=False, parents=plist))
+                if self.debug > 10: print("Individual " + str(indiv_temp) + ": " + indiv_temp.get_str())
 
-                    rcnt -= 1
-                if rcnt == 0:
-                    indiv_temp = parent['tree']
-                retries = self.max_retries - rcnt if self.max_retries > 0 else 1 - rcnt
-                retrie_cnt.append(retries)
-
-                # add newly formed child
-                new_population.append({'tree': indiv_temp, 'fitness': 0, 'depth': member_depth, 'nodes':member_nodes, 'tensor':[]})
-                #if member_depth > max_tree_depth:
-                #    max_tree_depth = member_depth
-
-                # print individual
-                if self.debug > 10: print("Individual " + str(current_individual) + ": " + indiv_temp.get_str())
-
-
+            # Print average retrie count
             if self.debug >= 4:
                 rstd = np.average(np.array(retrie_cnt))
                 print("[DEBUG]:\tAverage evolutionary ops retries for generation " + str(self.current_generation) + ": " + str(rstd))
 
-
             # calculate fitness of the new population
-            new_population, self.best = self.fitness_func_wrap(population=new_population,
-                                                                             f_path=self.experiment.current_directory)
+            temp_population, self.best = self.fitness_func_wrap(population=temp_population,
+                                                                f_path=self.experiment.current_directory)
 
-            # bloat_control
-            # if self.bloat_control == 'full_dynamic_dep':
-            #    self.max_tree_depth = min(self.best['depth'], self.min_tree_depth)
-            # elif self.bloat_control == 'dynamic_dep':
-            #    self.max_tree_depth = max(self.best['depth'], self.max_tree_depth)
-            # print("max tree depth: ", self.max_tree_depth)
+
+            if self.bloat_control == "off":
+                #for current_individual in range(self.population_size - self.elitism):
+                #    ind = temp_population[current_individual]
+                #    new_population.append(ind)
+                new_population += temp_population
+            else:
+                # bloat control - ['full_dynamic_dep' == very_heavy, 'dynamic_dep' heavy]
+                # https://www.researchgate.net/publication/220286086_Dynamic_limits_for_bloat_control_in_genetic_programming_and_a_review_of_past_and_current_bloat_theories
+                accepted = 0
+                depth_mode = self.bloat_mode == 'depth'
+                best_fit = self.best_overall['fitness']
+                for current_individual in range(self.population_size - self.elitism):
+                    ind = temp_population[current_individual]
+                    my_limit = get_largest_parent(depth_mode, ind) if has_illegal_parents(ind) else self.dynamic_limit
+
+                    sizeind = ind['depth'] if depth_mode else ind['nodes']
+                    fitnessind = ind['fitness']
+
+                    if sizeind <= my_limit:
+                        ind['valid'] = True
+                        accepted += 1
+                        if ((self.objective == 'minimizing') and (fitnessind < best_fit)) or ((self.objective != 'minimizing') and (fitnessind > best_fit)):
+                            best_fit = fitnessind
+
+                        if (self.bloat_control == 'full_dynamic_dep') or ((self.bloat_control == 'dynamic_dep') and (sizeind >= self.initial_dynamic_limit)):
+                            self.dynamic_limit = sizeind
+
+                    if sizeind > self.dynamic_limit and ((self.objective == 'minimizing') and (fitnessind < best_fit)) or ((self.objective != 'minimizing') and (fitnessind > best_fit)):
+                        ind['valid'] = True
+                        accepted += 1
+
+                        best_fit = fitnessind
+                        self.dynamic_limit = sizeind
+
+                # build new_pop
+                illegals = 0
+                passp = 0
+                for current_individual in range(self.population_size - self.elitism):
+                    ind = temp_population[current_individual]
+                    sizeind = ind['depth'] if depth_mode else ind['nodes']
+                    # build new pop according to the ones that passed last loop
+                    if ind['valid']:
+                        new_population.append(ind)
+                    else:
+                        passp += 1
+                        new_population.append(self.engine_rng.choice(ind['parents']))
+                    ind['valid'] = sizeind < self.dynamic_limit  # update illegals according to final limits
+                    if not ind['valid']:
+                        illegals += 1
 
             # update best and population
-            if self.objective_condition(self.best['fitness']):
+            if self.condition_overall(self.best['fitness']):
                 self.best_overall = copy.deepcopy(self.best)
             self.population = new_population
 
             # update engine time
             self.update_engine_time()
 
+            if self.debug > 10:
+                print("\ngenerated, passed, illegals, len(pop), passp", self.population_size - self.elitism, accepted, illegals, len(new_population), passp)
+                print("Pop")
+                i = 0
+                for ind in new_population:
+                    print("ind, fit, exp", i, ind['fitness'], ind['tree'].get_str())
+                    i += 1
+                print("Best (gen    ), fit, exp", self.best['fitness'], self.best['tree'].get_str())
+                print("Best (overall), fit, exp", self.best_overall['fitness'], self.best_overall['tree'].get_str())
+
+
             #if self.save_state == 0: self.print_population(self.population, minimal = True)
 
             # save engine state
             #if self.save_to_file != 0 and (self.current_generation % self.save_to_file) == 0:
-            self.save_state_to_file(self.experiment.logging_diredctory)
+            #self.save_state_to_file(self.experiment.logging_directory)
+            self.save_engine_state()
 
             # add population data to statistics and display gen statistics
             pops = self.population_stats(self.population)
@@ -1505,6 +1701,7 @@ class Engine:
             print(bcolors.OKBLUE + "[%7d, %10.6f, %10.6f, %10.6f, %10.6f, %10.3f, %10.6f, %10d, %10d, %10.3f, %10.6f, %10d, %10d, %10.6f, %10.6f, %10.6f]" %tuple(self.data[-1]), bcolors.ENDC)
 
             self.write_pop_to_csv(self.pop_file_path)
+            self.save_bests_log()
 
             # print engine state
             self.print_engine_state(force_print=False)
@@ -1514,16 +1711,21 @@ class Engine:
             self.experiment.seed += 1
 
         # write statistics(data) to csv
-        self.write_stats_to_csv(self.data, self.stats_file_path)
+        self.write_overall_to_csv(self.data)
+
+        # Write final enggine state to file
+        self.save_engine_state()
 
         # print final stats
         if self.debug < 0:
             self.print_engine_state(force_print=True)
         elif not self.minial_print:
-            print(bcolors.OKGREEN + "\nElapsed Engine Time: \t" + str(self.elapsed_engine_time) + " sec.")
-            print("\nElapsed Init Time: \t\t" + str(self.elapsed_init_time) + " sec.")
-            print("Elapsed Tensor Time: \t" + str(self.elapsed_tensor_time) + " sec.")
-            print("Elapsed Fitness Time:\t" + str(self.elapsed_fitness_time) + " sec.")
+            #TODO: make this an engine property for displaying to console (not to saved files)
+            places_to_round = 3
+            print(bcolors.OKGREEN + "\nElapsed Engine Time: \t" + str(round(self.elapsed_engine_time, places_to_round)) + " sec.")
+            print("\nElapsed Init Time   : \t" + str(round(self.elapsed_init_time, places_to_round)) + " sec.")
+            print("Elapsed Tensor Time : \t" + str(round(self.elapsed_tensor_time, places_to_round)) + " sec.")
+            print("Elapsed Fitness Time:\t" + str(round(self.elapsed_fitness_time, places_to_round)) + " sec.")
             print("\nBest individual (generation):\n" + bcolors.OKCYAN + self.best['tree'].get_str())
             print("\nBest individual (overall):\n" + bcolors.OKCYAN + self.best_overall['tree'].get_str(), bcolors.ENDC)
 
@@ -1531,14 +1733,37 @@ class Engine:
         if not self.minial_print: print(bcolors.BOLD + bcolors.OKGREEN +  "=" * 84, "\n\n", bcolors.ENDC)
 
         self.save_state += 1
-        tensors = tensors = [p['tensor'] for p in self.population]
+        tensors = [p['tensor'] for p in self.population]
         return self.data, tensors
 
-    def graph_statistics(self):
+    def selection(self):
+        parent = self.tournament_selection()
+        plist = []
+        if self.bloat_control != "off":
+            plist = [parent]
+        indiv_temp = parent['tree']
+        random_n1 = self.engine_rng.random()
+        random_n2 = self.engine_rng.random()
+        if random_n1 < self.crossover_rate:
+            parent_2 = self.tournament_selection()
+            if self.bloat_control != "off":
+                plist.append(parent_2)
+            indiv_temp = self.crossover(parent['tree'], parent_2['tree'])
+            # print("cross")
+        if random_n2 < self.mutation_rate:
+            indiv_temp = self.mutation(parent['tree'])
+            # print("mut")
+        if random_n1 >= self.crossover_rate and random_n1 >= self.crossover_rate:
+            indiv_temp = parent['tree']
+            # print("repro")
+        return indiv_temp, plist
 
+    def graph_statistics(self, extension = "pdf"):
+
+        if extension not in ["pdf", "svg"]:
+            extension = "pdf"
         if not self.show_graphics:
             matplotlib.use('Agg')
-
 
         matplotlib.rcParams.update({'font.size': 16})
         line_start = 2
@@ -1552,19 +1777,17 @@ class Engine:
         best_dep = []
         lcnt = 1
 
-        fn = self.experiment.working_directory if self.stats_file_path is None else self.stats_file_path
-        fs = self.experiment.working_directory if self.graphics_file_path is None else self.graphics_file_path
-        with open(fn + self.overall_stats_filename, mode='r') as csv_file:
+        with open(self.experiment.overall_fp, mode='r') as csv_file:
             csv_reader = csv.reader(csv_file)
             for row in csv_reader:
                 if self.debug > 10: print(row)
                 if line_start <= lcnt < line_end:
                     avg_fit.append(float(row[1]))
                     std_fit.append(float(row[2]))
-                    best_fit.append(float(row[4]))
+                    best_fit.append(float(row[3]))
                     avg_dep.append(float(row[5]))
                     std_dep.append(float(row[6]))
-                    best_dep.append(float(row[8]))
+                    best_dep.append(float(row[7]))
                 lcnt += 1
 
         # showing best overall
@@ -1578,7 +1801,7 @@ class Engine:
         ax.get_yaxis().set_major_formatter(mticker.ScalarFormatter())
         ax.set_title('Fitness across generations')
         fig.set_size_inches(12, 8)
-        plt.savefig(fname=fs + 'Fitness.svg', format="svg")
+        plt.savefig(fname=self.experiment.graphs_directory + 'Fitness.' + extension, format=extension)
         if self.show_graphics: plt.show()
         plt.close(fig)
 
@@ -1592,15 +1815,14 @@ class Engine:
         ax.get_yaxis().set_major_formatter(mticker.ScalarFormatter())
         ax.set_title('Avg depth across generations')
         fig.set_size_inches(12, 8)
-        plt.savefig(fname=fs + 'Depth.svg', format="svg")
+        plt.savefig(fname=self.experiment.graphs_directory + "Depth." + extension, format=extension)
         if self.show_graphics: plt.show()
         plt.close(fig)
 
 
-    def write_stats_to_csv(self, data, fp = None):
+    def write_overall_to_csv(self, data):
         # evolutionary stats across generations
-        fn = self.experiment.working_directory if fp is None else fp
-        fn += self.overall_stats_filename
+        fn = self.experiment.working_directory + "evolution.csv" if self.experiment.overall_fp is None else self.experiment.overall_fp
         with open(fn, mode='a', newline='') as file:
             fwriter = csv.writer(file, delimiter=',')
             ind = 0
@@ -1609,13 +1831,10 @@ class Engine:
                     file.write("[generation, fitness avg, fitness std, fitness generational best, fitness overall best, depth avg, depth std, depth generational best, depth overall best, generation time, fitness time, tensor time]\n")
                 fwriter.writerow(d)
                 ind += 1
-
-        # overall engine stats
-        #fn = self.experiment.working_directory + "tensorgp_" + str(self.target_dims[0]) + "_" + str(self.experiment.seed) + '_timings.csv'
-        fn = self.experiment.working_directory if self.stats_file_path is None else self.stats_file_path
-        fn += "tensorgp_" + str(self.target_dims[0]) + "_" + str(self.experiment.seed) + '_timings.csv'
+        
+        fn = self.experiment.working_directory + "timings.csv" if self.experiment.timings_fp is None else self.experiment.timings_fp
         with open(fn, mode='a', newline='') as file:
-            fwriter = csv.writer(file, delimiter=',')
+            fwriter = csv.writer(file, delimiter=',')        
             if self.save_state == 0:
                 file.write("[resolution, seed, initialization time, tensor time, fitness time, total, engine time]\n")
             fwriter.writerow([self.target_dims[0], self.experiment.seed, self.elapsed_init_time,
@@ -1629,79 +1848,72 @@ class Engine:
         self.last_engine_time = t_
 
 
+    def get_engine_state(self): # TODO: revise this, there are new variables
+        engine_state_str = "Engine state information:\n"
+        engine_state_str += "Population Size: " + str(self.population_size) + "\n"
+        engine_state_str += "Tournament Size: " + str(self.tournament_size) + "\n"
+        engine_state_str += "Mutation Rate: " + str(self.mutation_rate) + "\n"
+        engine_state_str += "Crossover Rate: " + str(self.crossover_rate) + "\n"
+        engine_state_str += "Maximun Tree Depth: " + str(self.max_tree_depth) + "\n"
+        engine_state_str += "Minimun Tree Depth: " + str(self.min_tree_depth) + "\n"
+        engine_state_str += "Initial Tree Depth: " + str(self.max_init_depth) + "\n"
+        engine_state_str += "Population method: " + str(self.method) + "\n"
+        engine_state_str += "Terminal Probability: " + str(self.terminal_prob) + "\n"
+        engine_state_str += "Scalar Probability (from terminals): " + str(self.scalar_prob) + "\n"
+        engine_state_str += "Uniform Scalar (scalarT) Probability (from terminals): " + str(self.uniform_scalar_prob) + "\n"
+        engine_state_str += "Stop Criteria: " + str(self.stop_criteria) + "\n"
+        engine_state_str += "Stop Value: " + str(self.stop_value) + "\n"
+        engine_state_str += "Objective: " + str(self.objective) + "\n"
+        engine_state_str += "Generations per immigration: " + str(self.immigration) + "\n"
+        engine_state_str += "Dimensions: " + str(self.target_dims) + "\n"
+        engine_state_str += "Max nodes: " + str(self.max_nodes) + "\n"
+        engine_state_str += "Debug Level: " + str(self.debug) + "\n"
+        engine_state_str += "Device: " + str(self.device) + "\n"
+        engine_state_str += "Save to log files: " + str(self.save_to_file_log) + "\n"
+        engine_state_str += "Save to image files: " + str(self.save_to_file_image) + "\n"
+        engine_state_str += "Generation: " + str(self.current_generation) + "\n"
+        engine_state_str += "Engine Seed : " + str(self.experiment.seed) + "\n" # redundancy
+        engine_state_str += "Engine ID : " + str(self.experiment.ID) + "\n"     # to check while loading
+        engine_state_str += "Elapse Engine Time: " + str(self.elapsed_engine_time) + "\n"
+        engine_state_str += "Elapse Initiation Time: " + str(self.elapsed_init_time) + "\n"
+        engine_state_str += "Elapse Tensor Time: " + str(self.elapsed_tensor_time) + "\n"
+        engine_state_str += "Elapse Fitness Time: " + str(self.elapsed_fitness_time) + "\n"
+        return engine_state_str
 
-    def save_state_to_file(self, filename):
-        #print("[DEBUG]:\t" + filename)
-        if self.write_final_pop and not self.condition():
-            #print("printing last stats")
-            with open(self.path_to_final_pop + self.experiment.get_experiment_filename() + "_final_pop.txt", "w") as text_file:
+
+    # alias for engine state
+    def summary(self):
+        return self.get_engine_state()
+
+
+    def save_engine_state(self):
+        if self.write_log:
+            with open(self.experiment.setup_fp, "w") as text_file:
                 try:
-                    for i in range(self.population_size):
-                        ind = self.population[i]
-                        text_file.write(str(ind['tree'].get_str()) + "\n")
-                except IOError as e:
-                    print(bcolors.FAIL + "[ERROR]:\tI/O error while writing engine state ({0}): {1}".format(e.errno, e.strerror) , bcolors.ENDC)
+                    text_file.write(self.get_engine_state())
+                except IOError as error:
+                    print(bcolors.FAIL + "[ERROR]:\tI/O error while writing engine state ({0}): {1}".format(error.errno, error.strerror) , bcolors.ENDC)
 
-        if self.write_log or not self.condition():
-            with open(filename + "log.txt", "w") as text_file:
+
+    def save_bests_log(self):
+        if self.save_bests:
+            with open(self.experiment.bests_fp, "a") as csv_file:
                 try:
-                    # general info
+                    if self.current_generation == 0: csv_file.write("generation, index, expression\n")
+                    writer = csv.writer(csv_file)
+                    writer.writerow([self.current_generation, self.best['fitness'], self.best['tree'].get_str()])
+                except IOError as error:
+                    print(bcolors.FAIL + "[ERROR]:\tI/O error while writing best overall individuals ({0}): {1}".format(error.errno, error.strerror) , bcolors.ENDC)
 
-                    text_file.write("Engine state information:\n")
-                    text_file.write("Population Size: " + str(self.population_size) + "\n")
-                    text_file.write("Tournament Size: " + str(self.tournament_size) + "\n")
-                    text_file.write("Mutation Rate: " + str(self.mutation_rate) + "\n")
-                    text_file.write("Crossover Rate: " + str(self.crossover_rate) + "\n")
-                    text_file.write("Minimun Tree Depth: " + str(self.max_tree_depth) + "\n")
-                    text_file.write("Maximun Tree Depth: " + str(self.min_tree_depth) + "\n")
-                    text_file.write("Initial Tree Depth: " + str(self.max_init_depth) + "\n")
-                    text_file.write("Population method: " + str(self.method) + "\n")
-                    text_file.write("Terminal Probability: " + str(self.terminal_prob) + "\n")
-                    text_file.write("Scalar Probability (from terminals): " + str(self.scalar_prob) + "\n")
-                    text_file.write("Uniform Scalar (scalarT) Probability (from terminals): " + str(self.uniform_scalar_prob) + "\n")
-                    text_file.write("Stop Criteria: " + str(self.stop_criteria) + "\n")
-                    text_file.write("Stop Value: " + str(self.stop_value) + "\n")
-                    text_file.write("Objective: " + str(self.objective) + "\n")
-                    text_file.write("Generations per immigration: " + str(self.immigration) + "\n")
-                    text_file.write("Dimensions: " + str(self.target_dims) + "\n")
-                    text_file.write("Max nodes: " + str(self.max_nodes) + "\n")
-                    text_file.write("Debug Level: " + str(self.debug) + "\n")
-                    text_file.write("Device: " + str(self.device) + "\n")
-                    text_file.write("Save to file: " + str(self.save_to_file) + "\n")
-                    # previous state and others
-                    text_file.write("Generation: " + str(self.current_generation) + "\n")
-                    text_file.write("Engine Seed : " + str(self.experiment.seed) + "\n") # redundancy
-                    text_file.write("Engine ID : " + str(self.experiment.ID) + "\n")     # to check while loading
-                    text_file.write("Elapse Engine Time: " + str(self.elapsed_engine_time) + "\n")
-                    text_file.write("Elapse Initiation Time: " + str(self.elapsed_init_time) + "\n")
-                    text_file.write("Elapse Tensor Time: " + str(self.elapsed_tensor_time) + "\n")
-                    text_file.write("Elapse Fitness Time: " + str(self.elapsed_fitness_time) + "\n")
+        if self.save_bests_overall:
+            with open(self.experiment.bests_overall_fp, "a") as csv_file:
+                try:
+                    if self.current_generation == 0: csv_file.write("generation, index, expression\n")
+                    writer = csv.writer(csv_file)
+                    writer.writerow([self.current_generation, self.best_overall['fitness'], self.best_overall['tree'].get_str()])
+                except IOError as error:
+                    print(bcolors.FAIL + "[ERROR]:\tI/O error while writing best individuals ({0}): {1}".format(error.errno, error.strerror) , bcolors.ENDC)
 
-                    # population
-                    text_file.write("\n\nPopulation: \n")
-
-                    text_file.write("\nBest individual (generation):")
-                    text_file.write("\nExpression: " + str(self.best['tree'].get_str()))
-                    text_file.write("\nFitness: " + str(self.best['fitness']))
-                    text_file.write("\nDepth: " + str(self.best['depth']) + "\n")
-
-                    text_file.write("\nBest individual (overall):")
-                    text_file.write("\nExpression: " + str(self.best_overall['tree'].get_str()))
-                    text_file.write("\nFitness: " + str(self.best_overall['fitness']))
-                    text_file.write("\nDepth: " + str(self.best_overall['depth']) + "\n")
-
-                    # 4 lines per indiv
-                    text_file.write("\nCurrent Population:\n")
-                    for i in range(self.population_size):
-                        ind = self.population[i]
-                        text_file.write("\n\nIndividual " + str(i) + ":")
-                        text_file.write("\nExpression: " + str(ind['tree'].get_str()))
-                        text_file.write("\nFitness: " + str(ind['fitness']))
-                        text_file.write("\nDepth: " + str(ind['depth']))
-
-
-                except IOError as e:
-                    print(bcolors.FAIL + "[ERROR]:\tI/O error while writing engine state ({0}): {1}".format(e.errno, e.strerror) , bcolors.ENDC)
 
     def print_population(self, population, minimal = False):
         if not minimal:
@@ -1774,6 +1986,7 @@ class Function_Set:
             'if': [3, resolve_if_node],
             'len': [2, resolve_len_node],
             'lerp': [3, resolve_lerp_node],
+            'lerpp': [3, resolve_lerp_node],
             'log': [1, resolve_log_node],
             'max': [2, resolve_max_node],
             'mdist': [2, resolve_mdist_node],
@@ -1920,3 +2133,7 @@ class Terminal_Set:
         for s in self.set:
             res += s + "\n"
         return res
+
+
+# Revise comments
+# Split long lines
