@@ -21,6 +21,10 @@ Original file is located at
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Adapted from https://www.tensorflow.org/tutorials/generative/dcgan
+import csv
+
+import pylab
 import tensorflow as tf
 
 tf.__version__
@@ -32,11 +36,21 @@ tf.__version__
 #import glob
 #import imageio
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import os
 import PIL
 from tensorflow.keras import layers
 import time
+import sys
+import datetime
+from keras.models import load_model
+
+delimiter = os.path.sep
+cnn_model = load_model('MNIST_keras_CNN.h5')
+
+gen_image_cnt = 0
+fake_image_cnt = 0
 
 #from IPython import display
 
@@ -47,15 +61,34 @@ The generator will generate handwritten digits resembling the MNIST data.
 """
 
 (train_images, train_labels), (_, _) = tf.keras.datasets.mnist.load_data()
+digits_to_train = [0]
+if len(sys.argv) > 1:
+    print("going for digit: ", sys.argv[1])
+    digits_to_train = [int(sys.argv[1])]
 
+train_mask = np.isin(train_labels, digits_to_train)
+train_images = train_images[train_mask]
+print("Length of dataset: ", len(train_images))
 train_images = train_images.reshape(train_images.shape[0], 28, 28, 1).astype('float32')
 train_images = (train_images - 127.5) / 127.5  # Normalize the images to [-1, 1]
+#train_images = train_images[:64] # testing purposes
 
 BUFFER_SIZE = 60000
-BATCH_SIZE = 256
+BATCH_SIZE = 32
 
 # Batch and shuffle the data
-train_dataset = tf.data.Dataset.from_tensor_slices(train_images).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+train_dataset = tf.data.Dataset.from_tensor_slices(train_images).shuffle(len(train_images)).batch(BATCH_SIZE)
+
+
+#paths
+
+temp = sys.argv[2] if len(sys.argv) > 2 else ""
+pref = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3] + "_" + temp
+# print(date)
+run_dir = os.getcwd() + delimiter + "gp_dcgan_results" + delimiter + "run__" + pref + delimiter
+gan_images = run_dir + "dcgan_images" + delimiter
+os.makedirs(gan_images)
+loss_hist = []
 
 """## Create the models
 Both the generator and discriminator are defined using the [Keras Sequential API
@@ -95,6 +128,8 @@ def make_generator_model():
 """Use the (as yet untrained) generator to create an image."""
 
 generator = make_generator_model()
+#generator.summary()
+
 
 noise = tf.random.normal([1, 100])
 generated_image = generator(noise, training=False)
@@ -127,7 +162,8 @@ The model will be trained to output positive values for real images, and negativ
 
 discriminator = make_discriminator_model()
 decision = discriminator(generated_image)
-print (decision)
+#print(discriminator.summary())
+#exit()
 
 """## Define the loss and optimizers
 Define loss functions and optimizers for both models.
@@ -178,9 +214,9 @@ checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
 
 """
 
-EPOCHS = 100
+EPOCHS = 5
 noise_dim = 100
-num_examples_to_generate = 16
+num_examples_to_generate = 32
 
 # You will reuse this seed overtime (so it's easier)
 # to visualize progress in the animated GIF)
@@ -193,9 +229,13 @@ The loss is calculated for each of these models, and the gradients are used to u
 
 # Notice the use of `tf.function`
 # This annotation causes the function to be "compiled".
-@tf.function
+#@tf.function
 def train_step(images):
+    global gen_image_cnt, fake_image_cnt
     noise = tf.random.normal([BATCH_SIZE, noise_dim])
+    gen_image_cnt += BATCH_SIZE
+    fake_image_cnt += len(images)
+    #print("len images, ", len(images))
 
     with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
       generated_images = generator(noise, training=True)
@@ -211,31 +251,40 @@ def train_step(images):
 
     generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
     discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+    loss_hist.append([disc_loss.numpy(), gen_loss.numpy()])
 
 def train(dataset, epochs):
+  s = 0
   for epoch in range(epochs):
-    start = time.time()
+      start = time.time()
 
-    for image_batch in dataset:
-      train_step(image_batch)
+      step = 0
+      for image_batch in dataset:
+          train_step(image_batch)
+          fn = run_dir + "gan_losses.txt"
+          with open(fn, mode='a', newline='') as file:
+              fwriter = csv.writer(file, delimiter=',')
+              if s == 0:
+                  file.write("[d_loss, g_loss]\n")
+              fwriter.writerow(loss_hist[-1])
+              print('[DCGAN - step {}/{} of epoch {}/{}]:\tTime so far: {} sec'.format(step + 1, len(dataset), epoch + 1, epochs, time.time() - start))
 
-    # Produce images for the GIF as you go
-    #display.clear_output(wait=True)
-    generate_and_save_images(generator,
-                             epoch + 1,
-                             seed)
+          s += 1
+          step += 1
 
-    # Save the model every 15 epochs
-    if (epoch + 1) % 15 == 0:
-      checkpoint.save(file_prefix = checkpoint_prefix)
+      # Produce images for the GIF as you go
+      #display.clear_output(wait=True)
+      #generate_and_save_images(generator, epoch + 1, seed)
 
-    print ('Time for epoch {} is {} sec'.format(epoch + 1, time.time()-start))
+      # Save the model every 15 epochs
+      if (epoch + 1) % 15 == 0:
+          checkpoint.save(file_prefix = checkpoint_prefix)
+
+      print('Time for epoch {} is {} sec'.format(epoch + 1, time.time()-start))
 
   # Generate after the final epoch
   #display.clear_output(wait=True)
-  generate_and_save_images(generator,
-                           epochs,
-                           seed)
+  #generate_and_save_images(generator, epochs, seed)
 
 """**Generate and save images**
 
@@ -246,18 +295,48 @@ def generate_and_save_images(model, epoch, test_input):
   # This is so all layers run in inference mode (batchnorm).
   predictions = model(test_input, training=False)
 
-  print(len(predictions))
-  print(predictions)
+  fn = gan_images + "digit_max.txt"
 
-  fig = plt.figure(figsize=(4, 4))
+  with open(fn, mode='a', newline='') as file:
+      fwriter = csv.writer(file, delimiter=',')
+      if epoch == 1:
+          file.write("[epoch, max]\n")
+      temp_list = np.argmax(classify_digits(predictions), axis=1)
+      #print(temp_list)
+      freq = np.count_nonzero(temp_list == digits_to_train[0]) / len(temp_list)
+      #print(freq)
+      fwriter.writerow([epoch] + list(temp_list) + [freq])
 
+  fig = plt.figure(figsize=(8, 4))
   for i in range(predictions.shape[0]):
-      plt.subplot(4, 4, i+1)
+      plt.subplot(4, 8, i + 1)
       plt.imshow(predictions[i, :, :, 0] * 127.5 + 127.5, cmap='gray')
       plt.axis('off')
 
-  plt.savefig('dcgan_images/image_at_epoch_{:04d}.png'.format(epoch))
+  plt.savefig(gan_images + 'image_at_epoch_{:04d}.png'.format(epoch))
   #plt.show()
+  plt.close()
+
+
+def plot_losses(show_graphics=False):
+    fig, ax = plt.subplots(1, 1)
+    ax.plot(range(len(loss_hist)), np.asarray(loss_hist)[:, 0], linestyle='-', label="D loss")
+    pylab.legend(loc='upper left')
+    ax.set_xlabel('Training steps')
+    ax.set_ylabel('Loss')
+    ax.get_xaxis().set_major_formatter(mticker.ScalarFormatter())
+    ax.get_yaxis().set_major_formatter(mticker.ScalarFormatter())
+    ax.set_title('Discriminator loss across training steps')
+    fig.set_size_inches(12, 8)
+    plt.savefig(fname=run_dir + 'Losses.svg', format="svg")
+    if show_graphics: plt.show()
+    plt.close(fig)
+
+
+def classify_digits(digits):
+    return cnn_model(digits, training=False)
+
+
 
 """## Train the model
 Call the `train()` method defined above to train the generator and discriminator simultaneously.
@@ -270,7 +349,12 @@ As training progresses, the generated digits will look increasingly real.
 After about 50 epochs, they resemble MNIST digits. This may take about one minute / epoch with the default settings on Colab.
 """
 
+start = time.time()
 train(train_dataset, EPOCHS)
+plot_losses()
+print('Time for all epochs is {} sec'.format(time.time()-start))
+print("Number of gen image: ", gen_image_cnt)
+print("Number of fake images: ", fake_image_cnt)
 
 """Restore the latest checkpoint."""
 
