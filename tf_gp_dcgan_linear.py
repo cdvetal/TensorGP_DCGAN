@@ -453,16 +453,16 @@ if __name__ == '__main__':
             for g in gens:
                 for cur_set in fsets:
                     print("doing: ", r, " digit ", d, " for ", g, " generations, seed ", seeds[r])
-                    sufix_str = 'digit_' + str(d) + "_archive"
+                    sufix_str = 'digit_' + str(d) + "_linear"
                     mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=g, fset=cur_set, digits_to_train=d,
                                         run_from_last_pop=True,
                                         linear_gens_per_batch=False,
-                                        do_archive=True,
+                                        do_archive=False,
                                         starchive=0,
                                         sufix=sufix_str,
                                         seed=seeds[r],
-                                        log_losses=True,
-                                        log_digits_class=True)
+                                        log_losses=False,
+                                        log_digits_class=False)
                     train_time, train_hist = mnist_dcgan.train(epochs=epochs)
                     print("Elapsed training time (s): ", train_time)
                     # mnist_dcgan.print_training_hist()
@@ -486,3 +486,5 @@ if __name__ == '__main__':
     print("Elapsed training time (s): ", train_time)
     mnist_dcgan.print_training_hist()
     """
+
+
