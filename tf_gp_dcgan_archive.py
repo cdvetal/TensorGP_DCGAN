@@ -1,5 +1,3 @@
-import tensorflow as tf
-
 from tensorgp.engine import *
 
 import matplotlib.pyplot as plt
@@ -8,7 +6,7 @@ import numpy as np
 import os
 import PIL
 from heapq import nsmallest, nlargest
-from tensorflow.keras import layers
+from keras import layers
 import time
 from keras.models import load_model
 from skimage import io
@@ -75,14 +73,8 @@ class dcgan(object):
         self.log_losses = log_losses
         self.log_digits_class = log_digits_class
 
-        temp = sys.argv[1] if len(sys.argv) > 1 else ""
-        pref = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3] + "_" + temp
-        sufix = '' if sufix is None else '_' + sufix
         # print(date)
-        self.run_dir = os.getcwd() + delimiter + "gp_dcgan_results" + delimiter + "run__" + pref + sufix + delimiter if run_dir is None else run_dir
-        self.gp_fp = self.run_dir + "gp" + delimiter if gp_fp is None else gp_fp
-        self.gan_images = self.run_dir + "dcgan_images" + delimiter
-        self.archive_dir = self.run_dir + "archive" + delimiter if archive_dir is None else archive_dir
+
         self.run_from_last_pop = run_from_last_pop
         self.linear_gens_per_batch = linear_gens_per_batch
 
@@ -99,10 +91,6 @@ class dcgan(object):
         resolution = [self.img_rows, self.img_cols]
         self.fset = normal_set if fset is None else fset
         stop_value = self.gens_per_batch - 1 if self.linear_gens_per_batch else 4
-
-        self.image_generator = Engine(target_dims=[1024, 1024],
-                                      effective_dims=2)
-        self.best_im_dir = self.gan_images + delimiter + "images"
 
 
         self.generator = Engine(fitness_func=self.disc_forward_pass,
@@ -121,8 +109,7 @@ class dcgan(object):
                                 min_init_depth=3,
                                 max_init_depth=6,
                                 terminal_prob=0.5,
-                                min_domain=-1,
-                                max_domain=1,
+                                domain=[-1, 1],
                                 bloat_control='off',
                                 elitism=1,
                                 codomain=[-1, 1],
@@ -131,22 +118,38 @@ class dcgan(object):
                                 effective_dims=2,
                                 seed=self.seed,
                                 debug=0,
-                                save_to_file=10000,
                                 #gen_display_step=10,
                                 minimal_print=True, # True
-                                save_graphics=True, # True
-                                show_graphics=False, #False
-                                write_gen_stats=True, # True
-                                write_log=True, # True
-                                stats_file_path=self.gp_fp,
-                                graphics_file_path=self.run_dir,
-                                run_dir_path=self.gp_fp,
+
+                                # saves
+                                save_to_file=1,  # save all images from each 10 generations
+                                save_graphics=True,
+                                show_graphics=False,
+                                exp_prefix='pref',
+                                save_image_pop=True,
+                                save_image_best=True,
+                                image_extension="jpg",
+                                save_log=True,
+                                save_to_file_log=1,
+
+                                #stats_file_path=self.gp_fp,
+                                #graphics_file_path=self.run_dir,
+                                #run_dir_path=self.gp_fp,
+
                                 read_init_pop_from_file=None,
+                                best_overall_dir=True,
                                 mutation_funcs=[Engine.subtree_mutation, Engine.point_mutation,
                                                 Engine.delete_mutation, Engine.insert_mutation],
                                 mutation_probs=[0.6, 0.2, 0.1, 0.1]
                                 )
 
+        # paths
+        self.run_dir = self.generator.get_working_dir()
+        self.gp_fp = self.run_dir + "gp" + delimiter if gp_fp is None else gp_fp
+        self.gan_images = self.run_dir + "dcgan_images" + delimiter
+        self.archive_dir = self.run_dir + "archive" + delimiter if archive_dir is None else archive_dir
+        self.gallery_res = [1024, 1024]
+        self.best_im_dir = self.gan_images + delimiter + "images"
 
         os.makedirs(self.gan_images)
         if self.do_archive:
@@ -158,7 +161,8 @@ class dcgan(object):
         self.training_time = 0
         self.loss_hist = []
 
-        self.digits_to_train = digits_to_train if digits_to_train is not None else [0 for i in range(10)]
+        # sieve classes
+        self.digits_to_train = digits_to_train if digits_to_train is not None else [i for i in range(10)]
         (self.x_train, y_train), (_, _) = tf.keras.datasets.mnist.load_data()
         train_mask = np.isin(y_train, self.digits_to_train)
         self.x_train = self.x_train[train_mask]
@@ -233,7 +237,7 @@ class dcgan(object):
             ep = self.gens_per_batch if self.linear_gens_per_batch else round(step / 10) + 5
             starchive = self.starchive if step == 0 else 0
             gen_image_cnt += self.batch_size * ep
-            print("Startb form last pop: ", self.run_from_last_pop)
+            #print("Startb form last pop: ", self.run_from_last_pop)
             _, generated_images = self.generator.run(stop_value=ep,
                                                     start_from_last_pop=self.run_from_last_pop,
                                                     #start_from_archive = starchive,
@@ -281,7 +285,7 @@ class dcgan(object):
                                                                                                                    epoch + 1, epochs, self.gloss,
                                                                                                                    self.dloss, time.time() - start))
             # Generate after the final epoch
-            #self.generate_and_save_images(step + 1, epoch + 1)
+            self.generate_and_save_images(step + 1, epoch + 1)
 
             if self.do_archive and ((epoch + 1) % self.archive_stf) == 0:
                 print("Saving archive...")
@@ -306,9 +310,8 @@ class dcgan(object):
             plt.subplot(4, 8, i + 1)
 
             if i == 0:
-                #tens = self.generator.population[0]['tree'].get_tensor(self.image_generator)
                 tens = self.generator.best['tensor']
-                best_tens = self.generator.final_transform_domain(tens)
+                best_tens = self.generator.domain_mapping(tens) #
 
             plt.imshow(self.last_gen_imgs[i, :, :, 0] * 127.5 + 127.5, cmap='gray')
             plt.axis('off')
@@ -318,7 +321,7 @@ class dcgan(object):
 
         fig = plt.figure(frameon=False)
         dpi = 96
-        fig.set_size_inches(self.image_generator.target_dims[0]/dpi, self.image_generator.target_dims[0]/dpi)
+        fig.set_size_inches(self.gallery_res[0]/dpi, self.gallery_res[1]/dpi)
         plt.imshow(best_tens, cmap='gray')
         plt.axis('off')
         plt.savefig(self.best_im_dir + delimiter + "best_in_batch_{:04d}_step{:04d}.png".format(e, s), dpi=dpi)
@@ -378,7 +381,7 @@ class dcgan(object):
             c = 0
             for ind in self.archive:
                 fwriter.writerow([str(c), ind['fitness'], ind['tree'].get_str()])
-                save_image(ind['tensor'], c, fn, self.generator.target_dims, addon='_archive_best')
+                save_image(ind['tensor'], c, fn, self.generator.target_dims, sufix='_archive_best')
                 c += 1
         with open(fn + "tensors.txt", mode='a', newline='') as file:
             fwriter = csv.writer(file, delimiter=',')
@@ -421,27 +424,35 @@ def classify_digits(digits):
 if __name__ == '__main__':
 
     gen_pop = 32
-    digits = [1]
     #if len(sys.argv) > 1:
     #    print("Going for digit: ", sys.argv[1])
     #    digits = [int(sys.argv[1])]
 
+    # main test for all
+    #gens = [50] # 50 # 1- teste maluco (tem de ser pelo menos 2)
+    #epochs = 5
+    #fsets = [std_set]
+    #runs = 30 # 15
+    #digits = range(1, 10) # 10
+
+
+
+    # secondary test
     gens = [50] # 50 # 1- teste maluco (tem de ser pelo menos 2)
-    epochs = 5
+    epochs = 2
     fsets = [std_set]
-    runs = 30 # 15
-    digits = range(0, 1) # 10
-    #digits = [0, 4, 7]
+    runs = 1
+    digits = [0]
 
     seeds = [random.randint(0, 0x7fffffff) for i in range(runs)]
     #seeds = [202020212022]
     #cnn_model.summary()
 
-    for r in range(runs): #jncor podia ser for seed in seeds:
+    for r in range(runs):  # jncor podia ser for seed in seeds:
         for d in digits:
             for g in gens:
                 for cur_set in fsets:
-                    print("doing: ",r," digit ",d," for ", g, " generations, seed ", seeds[r])
+                    print("doing: ", r, " digit ", d, " for ", g, " generations, seed ", seeds[r])
                     sufix_str = 'digit_' + str(d) + "_archive"
                     mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=g, fset=cur_set, digits_to_train=d,
                                         run_from_last_pop=True,
@@ -449,12 +460,12 @@ if __name__ == '__main__':
                                         do_archive=True,
                                         starchive=0,
                                         sufix=sufix_str,
-                                        seed = seeds[r],
-                                        log_losses = True,
-                                        log_digits_class = True)
-                    train_time, train_hist = mnist_dcgan.train(epochs = epochs)
+                                        seed=seeds[r],
+                                        log_losses=True,
+                                        log_digits_class=True)
+                    train_time, train_hist = mnist_dcgan.train(epochs=epochs)
                     print("Elapsed training time (s): ", train_time)
-                    #mnist_dcgan.print_training_hist()
+                    # mnist_dcgan.print_training_hist()
     print("Number of gen image: ", gen_image_cnt)
     print("Number of fake images: ", fake_image_cnt)
 
@@ -463,10 +474,8 @@ if __name__ == '__main__':
     gen_pop = 32
     #run_from_last_pop = True
     #linear_gens_per_batch = True
-
     gens = 100
     fsets = extended_set
-
     print("\n\nCurrent number of gens: ", gens)
     print("Current set: ", str(fsets))
     print("CRun from last pop?: ", False)
