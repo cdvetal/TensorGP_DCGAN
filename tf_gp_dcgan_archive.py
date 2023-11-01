@@ -259,6 +259,7 @@ class dcgan(object):
             #(self.last_gen_imgs.shape)
             gen_output = self.discriminator(self.last_gen_imgs, training=True)
             real_output = self.discriminator(images, training=True)
+            real_output = tf.sigmoid(real_output).numpy()
 
             self.compute_losses(gen_output, real_output)
 
