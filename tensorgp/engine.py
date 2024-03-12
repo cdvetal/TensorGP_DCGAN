@@ -25,6 +25,8 @@
 
 
 import csv
+import pickle
+import subprocess
 from collections import Counter
 import copy
 import datetime
@@ -44,9 +46,10 @@ from operator import itemgetter
 from PIL import Image
 import configparser
 import ast
+import torch
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-import tensorflow as tf
+#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+#import tensorflow as tf
 import numpy as np
 
 from skimage import io
@@ -67,235 +70,193 @@ _codomain_delta = _codomain[1] - _codomain[0]
 _final_transform = [0.0, 255.0]
 _final_transform_delta = _final_transform[1] - _final_transform[0]
 _do_final_transform = False
-_tf_type = tf.float32
+
+#_tf_type = tf.float32
+dtype = torch.float32
+torch_dtype_min = torch.finfo(dtype).min
+torch_dtype_max = torch.finfo(dtype).max
+cur_dev = 'cpu'
+
+warp_batch = 4
+save_seed_file = "seed.obj"
 
 # np debug options
 if _tgp_np_debug:
     np.set_printoptions(linewidth=1000)
     np.set_printoptions(precision=3)
 
+# torch has no astype
+TORCH_DTYPES = {
+    'torch.float32': torch.float32,
+    'torch.float64': torch.float64,
+    'torch.float': torch.float,
+    'torch.int': torch.int,
+    'torch.int32': torch.int32,
+    'torch.int64': torch.int64,
+    'torch.double': torch.double,
+    'torch.cdouble': torch.cdouble,
+}
+
 
 # taken from https://svn.blender.org/svnroot/bf-blender/trunk/blender/build_files/scons/tools/bcolors.py
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
+class Bcolors:
+    def __init__(self):
+        self.HEADER = '\033[95m'
+        self.OKBLUE = '\033[94m'
+        self.OKCYAN = '\033[96m'
+        self.OKGREEN = '\033[92m'
+        self.WARNING = '\033[93m'
+        self.FAIL = '\033[91m'
+        self.ENDC = '\033[0m'
+        self.BOLD = '\033[1m'
+        self.UNDERLINE = '\033[4m'
+    def removecolor(self):
+        self.HEADER = ''
+        self.OKBLUE = ''
+        self.OKCYAN = ''
+        self.OKGREEN = ''
+        self.WARNING = ''
+        self.FAIL = ''
+        self.ENDC = ''
+        self.BOLD = ''
+        self.UNDERLINE = ''
+
+bcolors = Bcolors()
 
 
-## ====================== Standard TensorFlow Ops  ====================== ##
-
-def resolve_var_node(dimensions, n):
+#============================== torch operators #==============================
+def node_var(dimensions, n):
     temp = np.ones(len(dimensions), dtype=int)
     temp[n] = -1
-    res = tf.reshape(tf.range(dimensions[n], dtype=tf.float32), temp)
-    _resolution = dimensions[n]
+    res = torch.reshape(torch.arange(0, dimensions[n], dtype=dtype), tuple(temp))
+    resolution = dimensions[n]
     dimensions[n] = 1
-    res = tf.scalar_mul(((1.0 / (_resolution - 1)) * _domain_delta), res)
-    res = tf.math.add(res, tf.constant(_domain[0], tf.float32, res.shape))
-    res = tf.tile(res, dimensions)
-    return res
+    res = torch.add(torch.full(res.shape, _domain[0]), res, alpha=((1.0 / (resolution - 1)) * _domain_delta))
+    return res.repeat(tuple(dimensions))
+
+def node_abs(x1, dims=[]):
+    return torch.abs(x1)
+
+def node_add(x1, x2, dims=[]):
+    return torch.add(x1, x2)
+
+def node_sub(x1, x2, dims=[]):
+    return torch.sub(x1, x2)
+
+def node_mul(x1, x2, dims=[]):
+    return torch.mul(x1, x2)
+
+def node_div(x1, x2, dims=[]):
+    return torch.where(x2 != 0.0, torch.div(x1, x2), torch.tensor(0.0, dtype=dtype, device=cur_dev))
+
+def node_bit_and(x1, x2, dims=[]):
+    left_child = torch.mul(x1, 1e6).int()
+    right_child = torch.mul(x2, 1e6).int()
+    return torch.mul(torch.bitwise_and(left_child, right_child), 1e-6)
+
+def node_bit_or(x1, x2, dims=[]):
+    left_child = torch.mul(x1, 1e6).int()
+    right_child = torch.mul(x2, 1e6).int()
+    return torch.mul(torch.bitwise_or(left_child, right_child), 1e-6)
+
+def node_bit_xor(x1, x2, dims=[]):
+    left_child = torch.mul(x1, 1e6).int()
+    right_child = torch.mul(x2, 1e6).int()
+    return torch.mul(torch.bitwise_xor(left_child, right_child), 1e-6)
+
+def node_cos(x1, dims=[]):
+    return torch.cos(torch.mul(x1, math.pi))
+
+def node_sin(x1, dims=[]):
+    return torch.sin(torch.mul(x1, math.pi))
+
+def node_tan(x1, dims=[]):
+    return torch.tan(torch.mul(x1, math.pi))
+
+def node_exp(x1, dims=[]):
+    return torch.exp(x1)
+
+def node_if(x1, x2, x3, dims=[]):
+    return torch.where(x3 < 0, x1, x2)
+
+def node_log(x1, dims=[]):
+    return torch.where(x1 > 0.0, torch.log(x1), torch.tensor(-1.0, dtype=dtype, device=cur_dev))
+
+def node_max(x1, x2, dims=[]):
+    return torch.max(x1, x2)
+
+def node_min(x1, x2, dims=[]):
+    return torch.min(x1, x2)
+
+def node_mdist(x1, x2, dims=[]):
+    return torch.mul(torch.add(x1, x2), 0.5)
+
+def node_mod(x1, x2, dims=[]):
+    return torch.where(x2 != 0.0, torch.fmod(x1, x2), torch.tensor(0.0, dtype=dtype, device=cur_dev))
+    #return torch.fmod(x1, x2)
+
+def node_neg(x1, dims=[]):
+    return torch.neg(x1)
+
+def node_pow(x1, x2, dims=[]):
+    return torch.where(x1 != 0, torch.pow(torch.abs(x1), torch.abs(x2)), torch.tensor(0.0, dtype=dtype, device=cur_dev))
 
 
-def resolve_abs_node(child1, dims=[]):
-    return tf.math.abs(child1)
+def node_sign(x1, dims=[]):
+    return torch.sign(x1)
 
+def node_sqrt(child1, dims=[]):
+    return torch.where(child1 > 0, torch.sqrt(child1), torch.tensor(0.0, dtype=dtype, device=cur_dev))
 
-def resolve_add_node(child1, child2, dims=[]):
-    return tf.math.add(child1, child2)
+def tensor_rmse(x1, x2):
+    x1 = torch.mul(x1, 1/127.5)
+    x2 = torch.mul(x2, 1/127.5)
+    return torch.sqrt(torch.mean(torch.square(torch.sub(x1, x2))))
 
+def node_clamp(tensor):
+    return torch.clip(tensor, _codomain[0], _codomain[1])
 
-def resolve_and_node(child1, child2, dims=[]):
-    left_child_tensor = tf.cast(tf.scalar_mul(1e6, child1), tf.int32)
-    right_child_tensor = tf.cast(tf.scalar_mul(1e6, child2), tf.int32)
-    return tf.scalar_mul(1e-6, tf.cast(tf.bitwise.bitwise_and(left_child_tensor, right_child_tensor), tf.float32))
-
-
-def resolve_xor_node(child1, child2, dims=[]):
-    left_child_tensor = tf.cast(tf.scalar_mul(1e6, child1), tf.int32)
-    right_child_tensor = tf.cast(tf.scalar_mul(1e6, child2), tf.int32)
-    return tf.scalar_mul(1e-6, tf.cast(tf.bitwise.bitwise_xor(left_child_tensor, right_child_tensor), tf.float32))
-
-
-def resolve_or_node(child1, child2, dims=[]):
-    left_child_tensor = tf.cast(tf.scalar_mul(1e6, child1), tf.int32)
-    right_child_tensor = tf.cast(tf.scalar_mul(1e6, child2), tf.int32)
-    return tf.scalar_mul(1e-6, tf.cast(tf.bitwise.bitwise_or(left_child_tensor, right_child_tensor), tf.float32))
-
-
-def resolve_cos_node(child1, dims=[]):
-    return tf.math.cos(tf.scalar_mul(math.pi, child1))
-
-
-def resolve_div_node(child1, child2, dims=[]):
-    left_child_tensor = tf.cast(child1, tf.float32)
-    right_child_tensor = tf.cast(child2, tf.float32)
-    return tf.math.divide_no_nan(left_child_tensor, right_child_tensor)
-
-
-def resolve_exp_node(child1, dims=[]):
-    return tf.math.exp(child1)
-
-
-def resolve_if_node(child1, child2, child3, dims=[]):
-    return tf.where(child1 < 0, child2, child3)
-
-
-def resolve_log_node(child1, dims=[]):
-    res = tf.where(child1 > 0, tf.math.log(child1), tf.constant(-1, tf.float32, dims))
-    return res
-
-
-def resolve_max_node(child1, child2, dims=[]):
-    return tf.math.maximum(child1, child2)
-
-
-def resolve_mdist_node(child1, child2, dims=[]):
-    return tf.scalar_mul(0.5, tf.add(child1, child2))
-
-
-def resolve_min_node(child1, child2, dims=[]):
-    return tf.math.minimum(child1, child2)
-
-
-def resolve_mod_node(child1, child2, dims=[]):
-    return tf.math.mod(child1, child2)
-
-
-def resolve_mult_node(child1, child2, dims=[]):
-    return tf.math.multiply(child1, child2)
-
-
-def resolve_neg_node(child1, dims=[]):
-    return tf.math.negative(child1)
-
-
-def resolve_pow_node(child1, child2, dims=[]):
-    return tf.where(child1 == 0, tf.constant(0, tf.float32, dims),
-                    tf.math.pow(tf.math.abs(child1), tf.math.abs(child2)))
-
-
-def resolve_sign_node(child1, dims=[]):
-    # return tf.math.divide_no_nan(tf.math.abs(child1),child1)
-    return tf.math.sign(child1)
-
-
-def resolve_sin_node(child1, dims=[]):
-    return tf.math.sin(tf.scalar_mul(math.pi, child1))
-
-
-def resolve_sqrt_node(child1, dims=[]):
-    return tf.where(child1 > 0, tf.math.sqrt(child1), tf.constant(0, tf.float32, dims))
-
-
-def resolve_sub_node(child1, child2, dims=[]):
-    return tf.math.subtract(child1, child2)
-
-
-def resolve_tan_node(child1, dims=[]):
-    return tf.where(child1 != (math.pi * 0.5), tf.math.tan(tf.scalar_mul(math.pi, child1)),
-                    tf.constant(0, tf.float32, dims))
-
-
-def resolve_warp_node(tensors, image, dimensions):
-    n = len(dimensions)
-    # print("[DEBUG]:\tWarp dimensions: " + str(dimensions))
-    # print("[DEBUG]:\tWarp log(y): ")
-    # print(tensors[1].numpy())
-
-    tensors = [tf.where(tf.math.is_nan(t), tf.zeros_like(t), t) for t in tensors]
-
-    indices = tf.stack([
-        tf.clip_by_value(
-            tf.round(tf.multiply(
-                tf.constant((dimensions[k] - 1) * 0.5, tf.float32, shape=dimensions),
-                tf.math.add(tensors[k], tf.constant(1.0, tf.float32, shape=dimensions))
-            )),
-            clip_value_min=0.0,
-            clip_value_max=(dimensions[k] - 1)
-        ) for k in range(n)],
-        axis=n
-    )
-
-    indices = tf.cast(indices, tf.int32)
-    # print("[DEBUG]:\tWarp Indices: ")
-    # print(indices.numpy())
-    return tf.gather_nd(image, indices)
-
+def node_clip(child1, child2, child3, dims=[]):  # a < n < b
+    return torch.min(torch.max(child1, child2), child3)
 
 # return x * x * x * (x * (x * 6 - 15) + 10);
-# simplified to x2*(6x3 - (15x2 - 10x)) to minimize TF operations
-def resolve_sstepp_node(child1, dims=[]):
-    x = resolve_clamp(child1)
-    x2 = tf.square(x)
-    return tf.add(tf.multiply(x2,
-                              tf.subtract(tf.scalar_mul(6.0 * _codomain_delta, tf.multiply(x, x2)),
-                                          tf.subtract(tf.scalar_mul(15.0 * _codomain_delta, x2),
-                                                      tf.scalar_mul(10.0 * _codomain_delta, x)))),
-                  tf.constant(_codomain[0], dtype=tf.float32, shape=dims))
+# simplified to x2*(6x3 - (15x2 - 10x)) to minimize operations
+def node_sstepp(x1, dims=[]):
+    x = node_clamp(x1)
+    x2 = torch.square(x)
 
+    return torch.add(torch.mul(x2,
+                              torch.sub(torch.mul(torch.mul(x, x2), 6.0 * _domain_delta),
+                                        torch.sub(torch.mul(x2, 15.0 * _domain_delta),
+                                                  torch.mul(x, 10.0 * _domain_delta)))),
+                     _codomain[0])
 
 # return x * x * (3 - 2 * x);
 # simplified to (6x2 - 4x3) to minimize TF operations
-def resolve_sstep_node(child1, dims=[]):
-    x = resolve_clamp(child1)
-    x2 = tf.square(x)
-    return tf.add(tf.subtract(tf.scalar_mul(3.0 * _codomain_delta, x2),
-                              tf.scalar_mul(2.0 * _codomain_delta, tf.multiply(x2, x))),
-                  tf.constant(_codomain[0], dtype=tf.float32, shape=dims))
+def node_sstep(x1, dims=[]):
+    x = node_clamp(x1)
+    x2 = torch.square(x)
+    return torch.add(torch.sub(torch.mul(3.0 * _domain_delta, x2),
+                               torch.mul(2.0 * _domain_delta, torch.mul(x2, x))),
+                  torch.tensor(_codomain[0], dtype=dtype, device=cur_dev))
 
+def node_step(x1, dims=[]):
+    return torch.where(x1 < 0.0,
+                    torch.tensor(-1.0, dtype=dtype, device=cur_dev),
+                    torch.tensor(1.0, dtype=dtype, device=cur_dev))
 
-def resolve_step_node(child1, dims=[]):
-    return tf.where(child1 < 0.0,
-                    tf.constant(-1.0, dtype=tf.float32, shape=dims),
-                    tf.constant(1.0, dtype=tf.float32, shape=dims))
+def node_frac(x1, dims=[]):
+    return torch.frac(x1)
 
+def node_len(x1, x2, dims=[]):
+    return torch.hypot(x1, x2)
 
-def resolve_clamp(tensor):
-    return tf.clip_by_value(tensor, clip_value_min=_codomain[0], clip_value_max=_codomain[1])
-    # return tf.cast(tf.cast(tensor, tf.uint8), tf.float32)
+def node_lerp(x1, x2, x3, dims=[]):
+    return torch.lerp(x1, x2, node_frac(node_abs(x3)))
 
+def node_stack(nums, dimensions, edims):
+    return torch.stack([torch.full(dimensions[:edims], float(carvar), dtype=dtype, device=cur_dev) for carvar in nums], dim = edims)
 
-def resolve_frac_node(child1, dims=[]):
-    return tf.subtract(child1, tf.floor(child1))
-
-
-def resolve_clip_node(child1, child2, child3, dims=[]):  # a < n < b
-    return tf.minimum(tf.maximum(child1, child2), child3)
-
-
-def resolve_len_node(child1, child2, dims=[]):
-    return tf.sqrt(tf.add(tf.square(child1), tf.square(child2)))
-
-
-def resolve_lerp_node(child1, child2, child3, dims=[]):
-    # child3 = resolve_frac_node(child3, dims)
-    t_dist = tf.subtract(child2, child1)
-    t_dist = tf.multiply(child3, t_dist)
-    return tf.math.add(child1, t_dist)
-
-
-def old_tf_rmse(child1, child2):
-    child1 = tf.cast(child1, tf.float32)
-    child2 = tf.cast(child2, tf.float32)
-    elements = np.prod(child1.shape.as_list())
-    sdiff = tf.math.squared_difference(child1, child2)
-    mse = tf.math.reduce_sum(sdiff).numpy() / elements
-    mse = math.sqrt(mse)
-    return mse
-
-
-# The idea is that this is always the same, so compile
-@tf.function
-def tf_rmse(child1, child2):
-    child1 = tf.scalar_mul(1 / 127.5, child1)
-    child2 = tf.scalar_mul(1 / 127.5, child2)
-    return tf.sqrt(tf.reduce_mean(tf.square(child1 - child2)))
 
 
 ## ====================== TensorFlow Node Class ====================== ##
@@ -323,14 +284,11 @@ class Node:
                 args = len(self.children)
                 last_dim = engref.terminal.dimension
                 if args == 1 or last_dim <= 1:
-                    return tf.constant(self.children[0], tf.float32, engref.target_dims)
+                    #return tf.constant(self.children[0], tf.float32, engref.target_dims)
+                    return torch.full(engref.target_dims, self.children[0], dtype=dtype)
                 else:
                     extend_children = self.children + ([self.children[-1]] * (last_dim - args))
-                    return tf.stack(
-                        [tf.constant(float(c), tf.float32, engref.target_dims[:engref.effective_dims]) for c in
-                         extend_children[:last_dim]],
-                        axis=engref.effective_dims
-                    )
+                    return node_stack(extend_children[:last_dim], engref.target_dims, engref.effective_dims)
                 # both cases do the same if args == 1, this condition is here for speed concerns if
                 # the last dimension is very big (e.g. 2d(1024, 1024) we don't want color in that case)
 
@@ -408,6 +366,22 @@ class Node:
             else:
                 return None, count_terms
 
+    def get_node_c1(self, n, count_terms=True, count_funcs=True):
+        if n == 0:
+            return self, 0
+        else:
+            node = None
+            if not self.terminal:
+                i = 0
+                for c in self.children:
+                    node, t = c.get_node_c(n - i - count_funcs)
+                    i += t
+                    if node is not None:
+                        break
+                return node, i + count_funcs
+            else:
+                return None, count_terms
+
     def debug_print_node(self):
         print("\nFancy node print")
         print(self.fancy_print())
@@ -437,7 +411,7 @@ def get_np_array(tensor):
     if ((not ((not _do_final_transform) and _codomain[0] == 0.0 and _codomain[1] == 255.0)) and (not (
             _do_final_transform and _final_transform[0] == 0.0 and _final_transform[1] == 255.0))):
         tensor = get_final_transform(tensor, 255.0, 0.0)
-    return np.array(tensor, dtype='uint8')
+    return np.array(tensor.cpu(), dtype='uint8')
 
 
 def save_image(tensor, index, fn, dims, sufix='', extension=".png", BGR=False):  # expects [min_domain, max_domain]
@@ -445,6 +419,7 @@ def save_image(tensor, index, fn, dims, sufix='', extension=".png", BGR=False): 
     if extension.strip(".") not in ["png", "jpg", "jpeg"]:
         extension = ".png"
     path = fn + "_ind" + str(index).zfill(5) + sufix + extension
+    # print(path)
     aux = get_np_array(tensor)
 
     # print()
@@ -455,9 +430,11 @@ def save_image(tensor, index, fn, dims, sufix='', extension=".png", BGR=False): 
 
     try:
         if len(dims) == 2:
+            #os.makedirs(path, exist_ok=True)
             Image.fromarray(aux, mode="L").save(path)  # no color
         elif len(dims) == 3:
             if BGR: aux = aux[:, :, ::-1]
+            #os.makedirs(path, exist_ok=True)
             Image.fromarray(aux, mode="RGB").save(path)  # color
         else:
             print("Attempting to save tensor with rank ", len(dims),
@@ -507,33 +484,35 @@ def str_to_tree_normal(stree, terminal_set, number_nodes=0, constrain_domain=Tru
         #    children = [children[1], children[2], children[0]]
         return number_nodes + 1, Node(value=primitive, terminal=False, children=children)
 
+def set_device(device = 'gpu', debug_lvl = 1):
+    cuda_build = torch.backends.cuda.is_built()
+    gpus_available = []
+    if cuda_build:
+        cuda_build = cuda_build and torch.cuda.is_available()
+        gpus_available = len([torch.cuda.device(i) for i in range(torch.cuda.device_count())])
 
-def set_device(device='/gpu:0', debug_lvl=1):
-    cuda_build = tf.test.is_built_with_cuda()
-    gpus_available = len(tf.config.list_physical_devices('GPU'))
-
-    # These won't give an error but will be unspecified
+    # because these won't give an error but will be unspecified
     if (device is None) or (device == '') or (device == ':'):
-        device = '0'
+        device = 'cpu'
+        torch.set_default_device('cpu')
     try:
-        result_device = device
+        result_device = torch.device('cuda' if (device == 'gpu' or device == 'cuda') and cuda_build else 'cpu')
 
-        # just to verify errors
-        with(tf.device(device)):
-            a = tf.constant(2, dtype=tf.float32)
-            if debug_lvl > 0:
-                if a == 2:
-                    print(bcolors.OKGREEN + "Device " + device + " successfully tested, using this device. ",
-                          bcolors.ENDC)
-                else:
-                    print(bcolors.FAIL + "Device " + device + " not working." + bcolors.ENDC)
+        #print("Device to try: ", result_device)
+        a = torch.full((), 2, dtype=dtype, device=result_device)
+        if debug_lvl > 0:
+            if a == 2:
+                print(bcolors.OKGREEN + "Device " + result_device.__str__() + " successfully tested, using this device. " , bcolors.ENDC)
+            else:
+                print(bcolors.FAIL + "Device " + result_device.__str__() + " not working." , bcolors.ENDC)
+        torch.set_default_device('cuda')
     except RuntimeError or ValueError:
         if cuda_build and gpus_available > 0:
-            result_device = '/gpu:0'
-            print(bcolors.WARNING + "[WARNING]:\tCould not find the specified device, reverting to GPU." + bcolors.ENDC)
+            result_device = 'cuda'
+            print(bcolors.WARNING + "[WARNING]:\tCould not find the specified device, reverting to GPU." , bcolors.ENDC)
         else:
-            result_device = '/cpu:0'
-            print(bcolors.WARNING + "[WARNING]:\tCould not find the specified device, reverting to CPU." + bcolors.ENDC)
+            result_device = 'cpu'
+            print(bcolors.WARNING + "[WARNING]:\tCould not find the specified device, reverting to CPU." , bcolors.ENDC)
     return result_device
 
 
@@ -548,28 +527,27 @@ def serialize_sets(obj):
 
 
 def load_engine(fitness_func=None, var_func=None, mutation_funcs=None, pop_source=None,
-                file_path='', file_name='state.log'):
+                file_path='', file_name='state.log', seed_file_name = None):
     config = configparser.RawConfigParser()
     fn = file_path + file_name
     config.read(fn)
     conf_dict = dict(config.items('state'))
 
     # print(conf_dict)
-    # Serializing json
-    # json_object = json.dumps(conf_dict, indent=4)
-    # print(json_object)
 
     kwargs = {}
     for k, v in conf_dict.items():
+
         if k[0] != '_':
             if k == 'tf_type':
-                kwargs[k] = tf.as_dtype(v.split("'")[1])
+                #kwargs[k] = tf.as_dtype(v.split("'")[1])
+                kwargs[k] = TORCH_DTYPES[v.split("'")[0]]
             elif v[0] == "{":
                 kwargs[k] = set(v[1:-1].replace("'", "").replace(" ", "").split(","))
             else:
                 try:
                     kwargs[k] = ast.literal_eval(v)
-                    # kwargs[k] = eval(v)
+
                 except (ValueError, SyntaxError):
                     kwargs[k] = v
                 except:
@@ -577,25 +555,51 @@ def load_engine(fitness_func=None, var_func=None, mutation_funcs=None, pop_sourc
                         v) + "." + bcolors.END)
                     raise
 
-    if pop_source is None:
-        last_source = kwargs['read_init_pop_from_source']
-        print("[WARNING]:\tNew population source is None, reading population from last engine source: " +
-              ("Random inititialization" if last_source is None else str(last_source)) + ".")
-    else:
-        kwargs['read_init_pop_from_source'] = pop_source
 
-    # print(kwargs)
-    # json_object = json.dumps(kwargs, indent=4, default=serialize_sets)
-    # print(json_object)
-
+    gen_num =  int(conf_dict['_current_generation'])
     print(bcolors.WARNING + "Loading engine with timestamp: " +
           datetime.datetime.fromtimestamp(int(float(conf_dict['_last_engine_time']))).strftime(
               '%Y-%m-%d %H:%M:%S') + bcolors.ENDC)
+    print(bcolors.WARNING + "Starting from generation: " + str(gen_num) + bcolors.ENDC)
+
+    #gen_str = str(conf_dict['_last_pop']).replace('\\', "\\\\")
+    gen_str = str(conf_dict['_last_pop'])
+    work_dir = str(conf_dict['_work_dir'])
+    #print("Gen str", gen_str)
+    #print("os spe", os.path.sep)
+    if pop_source is None:
+        if gen_str is not None:
+            kwargs['read_init_pop_from_source'] = gen_str
+            print(bcolors.WARNING + "Starting from population found in file: " + gen_str + bcolors.ENDC)
+        else:
+            last_source = kwargs['read_init_pop_from_source']
+            print("[WARNING]:\tNew population source is None, reading population from last engine source: " +
+                  ("Random inititialization" if last_source is None else str(last_source)) + ".")
+    else: kwargs['read_init_pop_from_source'] = pop_source
+
+    # load seed
+    flag_seed = True
+    ss = None
+    try:
+        sfp = (work_dir + save_seed_file) if seed_file_name is None else seed_file_name
+        with open(sfp, 'rb') as pickle_seed_file:
+            ss = pickle.load(pickle_seed_file)
+            print(bcolors.WARNING + "Loading seed from file: " + sfp + bcolors.ENDC)
+
+    except (FileNotFoundError, TypeError):
+        #kwargs['seed_state'] = None
+        flag_seed = False
+    if not flag_seed:
+        print(bcolors.WARNING + "Did not find suitable seed file, randomizing seed: " + bcolors.ENDC)
+        kwargs['seed'] = random.randint(0, 0x7fffffff)
+
+    # print(kwargs)
     engine = Engine(fitness_func=fitness_func,
                     var_func=var_func,
                     mutation_funcs=mutation_funcs,
+                    seed_state=ss,
                     **kwargs)
-    engine.current_generation = int(conf_dict['_current_generation'])
+    engine.current_generation = gen_num
     engine.save_state = int(conf_dict['_save_state']) + 1
 
     return engine
@@ -604,16 +608,20 @@ def load_engine(fitness_func=None, var_func=None, mutation_funcs=None, pop_sourc
 # TODO: should this be an inner class of Engine()?
 class Experiment:
 
-    def set_experiment_filename(self, addon=None):
-        date = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3]
-        prefix = addon if addon is not None else ""
-        return prefix + "__run__" + date + "__" + str(self.ID)
+    def set_experiment_filename(self, fixed_path=False, addon=None):
+        if fixed_path is None:
+            date = datetime.datetime.utcnow().strftime('%Y_%m_%d__%H_%M_%S_%f')[:-3]
+            experiment_filename = (addon if addon is not None else "") + "__run__" + date + "__" + str(self.ID)
+        else:
+            experiment_filename = str(fixed_path)
+
+        return experiment_filename
 
     def set_generation_directory(self, generation, can_save_image_pop):
         try:
             self.cur_image_directory = self.all_directory + "generation_" + str(generation).zfill(5) + _tgp_delimiter
             if can_save_image_pop():
-                os.makedirs(self.cur_image_directory)
+                os.makedirs(self.cur_image_directory, exist_ok=True)
             # print("[DEBUG]:\tSet current directory to: " + self.current_directory)
         except OSError as error:
             if error is FileExistsError:
@@ -659,18 +667,19 @@ class Experiment:
                  immigration=None,
                  seed=None,
                  wd=None,
+                 fixed = False,
                  addon=None,
                  best_overall_dir=False):
 
         self.ID = self.set_experiment_ID()
         self.seed = self.ID if (seed is None) else seed
-        self.filename = self.set_experiment_filename(addon=addon)
+        self.filename = self.set_experiment_filename(addon=addon, fixed_path=fixed)
         self.prefix = addon
 
         try:
-            self.working_directory = (
-                    os.getcwd() + sub_wd + addon + _tgp_delimiter + self.filename + _tgp_delimiter) if wd is None else wd
-            os.makedirs(self.working_directory)
+            self.working_directory = (os.getcwd() + sub_wd + addon + _tgp_delimiter + self.filename + _tgp_delimiter) if wd is None else wd
+            os.makedirs(self.working_directory, exist_ok=True)
+
         except OSError as error:
             if error is FileExistsError:
                 print(
@@ -698,13 +707,16 @@ class Experiment:
         self.generations_directory = self.logging_directory + "generations" + _tgp_delimiter
         self.graphs_directory = self.working_directory
         try:
+
             os.makedirs(self.current_directory, exist_ok=True)
             os.makedirs(self.image_directory, exist_ok=True)
-            if best_overall_dir: os.makedirs(self.best_overall_directory, exist_ok=True)
+            if best_overall_dir:
+                os.makedirs(self.best_overall_directory, exist_ok=True)
             os.makedirs(self.cur_image_directory, exist_ok=True)
             os.makedirs(self.bests_directory, exist_ok=True)
             os.makedirs(self.all_directory, exist_ok=True)
-            if immigration is not None: os.makedirs(self.immigration_directory)
+            if immigration is not None:
+                os.makedirs(self.immigration_directory)
             os.makedirs(self.logging_directory, exist_ok=True)
             os.makedirs(self.generations_directory, exist_ok=True)
             os.makedirs(self.graphs_directory, exist_ok=True)
@@ -783,6 +795,22 @@ def default_json(obj):
     # return json.JSONEncoder.default(self, obj)
 
 
+
+
+#TODO: check rest of code to use this function where it fits
+def print_population(population, best=None, print_expr=False, msg=""):
+    print("\nPopulation print", msg)
+    for i in range(len(population)):
+        to_p = "Fitness of ind " + str(i) + ": " + str(population[i]['fitness'])
+        if print_expr:
+            to_p += ", expr:  " + population[i]['tree'].get_str()
+        print(to_p)
+    if best is not None:
+        to_p = "Fitness of best: " + str(best['fitness'])
+        if print_expr:
+            to_p += ", expr:  " + best['tree'].get_str()
+        print(to_p)
+
 ## ====================== Engine ====================== ##
 
 class Engine:
@@ -860,6 +888,7 @@ class Engine:
 
         return new_ind
 
+
     def crossover(self, parent_1, parent_2):
         crossover_node = None
 
@@ -896,6 +925,7 @@ class Engine:
 
         return new_ind
 
+
     def get_candidates(self, node, root):
         candidates = Counter()
         if not node.terminal:
@@ -906,6 +936,7 @@ class Engine:
         if root and candidates == Counter():
             candidates.update([node])
         return candidates
+
 
     def tournament_selection(self):
         if self.objective == 'minimizing':
@@ -922,6 +953,7 @@ class Engine:
                     winner = i
         return winner
 
+
     def mutation(self, parent):
         random_n = self.engine_rng.random()
         for k in range(len(self.mutation_funcs) - 1, -1, -1):
@@ -932,12 +964,15 @@ class Engine:
                 else:
                     return self.mutation_funcs[k](parent)
 
+
     def random_terminal(self):
         _, node = self.generate_program(method='full', max_nodes=0, max_depth=0)
         return node
 
+
     def copy_node(self, n):
         return Node(value=n.value, terminal=n.terminal, children=[] + n.children)
+
 
     def delete_mutation(self, parent):
         new_ind = copy.deepcopy(parent)
@@ -959,6 +994,7 @@ class Engine:
             chosen_node.children = chosen_child.children  # does not need []
 
         return new_ind
+
 
     def insert_mutation(self, parent):
         new_ind = copy.deepcopy(parent)
@@ -1000,6 +1036,7 @@ class Engine:
                 chosen_child.children.append(self.random_terminal())
         return new_ind
 
+
     def list_nodes(self, node, dep=0, root=False, add_funcs=True, add_terms=True, add_root=False):
         res = []
         if (node.terminal and (add_terms or (root and add_root))) or (
@@ -1009,6 +1046,7 @@ class Engine:
             for c in node.children:
                 res += self.list_nodes(c, dep + 1, False, add_funcs, add_terms, add_root)
         return res
+
 
     # This is the same , except it does not go back to the loop
     def hacky_subtree_mutation(self, parent):
@@ -1031,6 +1069,7 @@ class Engine:
             new_ind = mutation_node
         return new_ind
 
+
     def subtree_mutation(self, parent):
         new_ind = copy.deepcopy(parent)
         # candidates = self.get_candidates(new_ind, True)
@@ -1046,6 +1085,7 @@ class Engine:
         else:  # means its root in this case
             new_ind = mutation_node
         return new_ind
+
 
     # TODO: Support for genetic operators per node
     def replace_nodes(self, node):
@@ -1089,12 +1129,14 @@ class Engine:
                 if self.engine_rng.random() < self.replace_prob:
                     self.replace_nodes(i)
 
+
     def point_mutation(self, parent):
         new_ind = copy.deepcopy(parent)
         candidates = self.list_nodes(new_ind, root=True, add_funcs=True, add_terms=True, add_root=True)
         chosen_node, _ = self.engine_rng.choice(candidates)
         self.replace_nodes(chosen_node)
         return new_ind
+
 
     ### needs to be passed
     def __init__(self,
@@ -1125,6 +1167,7 @@ class Engine:
                  codomain=None,
                  final_transform=None,
                  do_final_transform=False,
+                 fixed_path=None,
 
                  bloat_control='off',
                  bloat_mode='depth',
@@ -1146,9 +1189,10 @@ class Engine:
                  target=None,
                  max_nodes=-1,
                  seed=None,
+                 seed_state=None,
                  debug=0,
                  save_graphics=True,
-                 show_graphics=True,
+                 show_graphics=False,
                  save_image_best=True,
                  save_image_pop=True,
                  save_to_file=10,
@@ -1161,6 +1205,7 @@ class Engine:
                  exp_prefix='',
                  device='/cpu:0',
                  do_bgr=False,
+                 interface=False,
 
                  polar_coordinates=False,
                  do_polar_mask=True,
@@ -1172,20 +1217,25 @@ class Engine:
 
                  save_log=True,
                  write_engine_state=True,
+                 no_disk=False,
 
                  last_init_time=None,
                  last_fitness_time=None,
                  last_tensor_time=None,
                  last_engine_time=None,
-                 tf_type=tf.float32,
+                 tf_type=torch.float32,
 
+                 color_print=True,
                  initial_test_device=True,
                  var_func=None, #
+                 reeval_elite = False,
                  best_overall_dir = False,
                  stats_file_path=None,
                  graphics_file_path=None,
                  pop_file_path=None,
                  run_dir_path=None,
+                 reeval_fitness_start=True,
+                 start_fitness_file=None,
                  read_init_pop_from_file=None,  # to be deprecated
                  read_init_pop_from_source=None):
 
@@ -1196,6 +1246,10 @@ class Engine:
         self.elapsed_fitness_time = 0 if last_fitness_time is None else last_fitness_time
         self.elapsed_tensor_time = 0 if last_tensor_time is None else last_tensor_time
         self.elapsed_engine_time = 0 if last_engine_time is None else last_engine_time
+
+        # define style
+        self.colored_print = color_print
+        if not color_print: bcolors.removecolor()
 
         # check for fitness func
         self.fitness_func = fitness_func
@@ -1222,6 +1276,7 @@ class Engine:
         self.save_graphics = save_graphics
         self.show_graphics = show_graphics
         self.do_bgr = do_bgr
+        self.reeval_elite = reeval_elite
 
         if bloat_control not in ['very heavy', 'heavy', 'weak']:  # add full_dynamic_size, dynamic_size
             bloat_control = 'off'
@@ -1279,9 +1334,7 @@ class Engine:
         self.effective_dims = self.dimensionality if effective_dims is None else effective_dims
         self.initial_test_device = initial_test_device
         self.device = set_device(device=device) if self.initial_test_device else device  # Check for available devices
-        self.experiment = Experiment(seed=seed, wd=self.run_dir_path, addon=str(exp_prefix), best_overall_dir=best_overall_dir)
-        self.engine_rng = random.Random(self.experiment.seed)
-        tf.random.set_seed(self.experiment.seed)
+
         self.method = method if (method in ['ramped half-and-half', 'grow', 'full']) else 'ramped half-and-half'
         self.replace_mode = replace_mode if replace_mode == 'dynamic_arities' else 'same_arity'
         self.image_extension = '.' + (image_extension if (image_extension in ['png', 'jpeg', 'bmp', 'jpg']) else 'png')
@@ -1289,12 +1342,52 @@ class Engine:
             graphic_extension if (graphic_extension in ['pdf', 'png', 'jpg', 'jpeg']) else 'pdf')
         self.replace_prob = max(0.0, min(1.0, replace_prob))
         self.pop_source = read_init_pop_from_file if read_init_pop_from_file is not None else read_init_pop_from_source
-        self.save_log = save_log
-        self.write_engine_state = write_engine_state
-        self.save_image_best = save_image_best
-        self.save_bests = save_bests
-        self.save_bests_overall = save_bests_overall
-        self.save_image_pop = save_image_pop
+        self.start_fitness_file = start_fitness_file
+        self.reeval_fitness_start = reeval_fitness_start
+        self.seed = seed
+
+
+        self.no_disk = no_disk
+        if no_disk:
+            self.save_to_file = False
+            self.save_to_file_image = False
+            self.save_to_file_log = False
+            self.save_to_file_state = False
+            self.save_log = False
+            self.write_engine_state = False
+            self.save_image_best = False
+            self.save_bests = False
+            self.save_bests_overall = False
+            self.save_image_pop = False
+            self.interface = []
+            self.fixed_path = []
+            self.experiment = []
+        else:
+            self.save_log = save_log
+            self.write_engine_state = write_engine_state
+            self.save_image_best = save_image_best
+            self.save_bests = save_bests
+            self.save_bests_overall = save_bests_overall
+            self.save_image_pop = save_image_pop
+
+            self.fixed_path = fixed_path
+            self.experiment = Experiment(seed=seed, wd=self.run_dir_path, addon=str(exp_prefix), fixed=self.fixed_path,
+                                         best_overall_dir=best_overall_dir)
+            self.flag_file = self.experiment.all_directory + "_flag_to_evolve"
+            self.interface = interface
+
+
+        self.active_interface = False # it's here because of the feednplay
+
+        # self.engine_rng = random.Random(self.seed) if seed_state is None else random.Random().setstate(seed_state)
+        # random.Random().setstate(seed_state) does not work
+        print(self.seed)
+        self.engine_rng = random.Random(self.seed)
+
+        if seed_state is not None:
+            self.engine_rng.setstate(seed_state)
+
+
         self.save_state = 0
         self.last_stop = 0
 
@@ -1324,7 +1417,7 @@ class Engine:
 
         # check for tf data type validity
         self.tf_type = tf_type if (hasattr(tf_type, "__module__") and (
-                    ('tensorflow' and 'dtypes') in tf_type.__module__.split("."))) else tf.float32
+                ('torch' and 'dtypes') in tf_type.__module__.split("."))) else torch.float32
         _tf_type = self.tf_type
 
         # set domain
@@ -1350,7 +1443,7 @@ class Engine:
         self.polar_mask_value_expr = 'undefined'
         self.do_polar_mask = do_polar_mask
         self.polar_mask_value = polar_mask_value
-        self.polar_mask = tf.ones(self.target_dims, dtype=tf.float32)
+        self.polar_mask = torch.ones(self.target_dims, dtype=torch.float32)
 
         if const_range is None or len(const_range) < 1:
             self.erc_min = _domain[0]
@@ -1367,7 +1460,7 @@ class Engine:
 
         # define terminal set
         if var_func is None or not callable(var_func):
-            self.var_func = resolve_var_node
+            self.var_func = node_var
         else:
             self.var_func = var_func
         if isinstance(terminal_set, Terminal_Set):
@@ -1389,10 +1482,9 @@ class Engine:
             # target = 'mult(scalar(127.5), ' + target + ')'
             _, tree = str_to_tree(target, self.terminal.set, constrain_domain=False)
 
-            with tf.device(self.device):
-                self.target = tf.cast(
-                    get_final_transform(tree.get_tensor(self), _final_transform_delta, _final_transform[0]),
-                    tf.float32)  # cast to an int tensor
+            #with tf.device(self.device):
+            final_temp = get_final_transform(tree.get_tensor(self), _final_transform_delta, _final_transform[0])
+            self.target = final_temp.type(torch.float32)
                 # self.target = tf.cast(tree.get_tensor(self) * 127.5, tf.float32) # cast to an int tensor
         else:
             self.target = target
@@ -1412,9 +1504,9 @@ class Engine:
         if stop_criteria == 'fitness':  # if fitness then stop value means error
             self.stop_value = stop_value
             if self.objective == 'minimizing':
-                self.condition = lambda: (self.best > self.stop_value)
+                self.condition = lambda: (self.best['fitness'] > self.stop_value)
             else:
-                self.condition = lambda: (self.best < self.stop_value)
+                self.condition = lambda: (self.best['fitness'] < self.stop_value)
             self.next_condition = self.condition
         else:  # if generations then stop_value menas number of generations to evaluate
             self.stop_value = int(stop_value)
@@ -1424,7 +1516,7 @@ class Engine:
         # update timers
         self.elapsed_init_time += time.time() - start_init
         if self.debug > 0: print("Elapsed init time: ", self.elapsed_init_time)
-        print(bcolors.OKGREEN + "Engine seed:" + str(self.experiment.seed) + bcolors.ENDC)
+        print(bcolors.OKGREEN + "Engine seed:" + str(self.seed) + bcolors.ENDC)
         self.update_engine_time()
 
         self.population = []
@@ -1441,7 +1533,8 @@ class Engine:
                 bloat=False, trees=False, timers=False, general=False, probs=False, domain=False, graphics=False,
                 extra=False, images=False, logs=False, paths=False, experiment=False, terminals=False,
                 functions=False, population=False, log_format=False, write_file=False, file_path=None,
-                file_name='state.log'):
+                file_name='state.log', pop_path = None):
+
 
         summary_str = ""
         if force_print:
@@ -1478,7 +1571,7 @@ class Engine:
             if not log_format: summary_str += "Fitness function: " + get_func_name(self.fitness_func) + "\n"
             summary_str += ("_current_generation = " if log_format else "Current generation: ") + str(
                 self.current_generation) + "\n"
-            summary_str += ("seed = " if log_format else "Seed: ") + str(self.experiment.seed) + "\n"
+            summary_str += ("seed = " if log_format else "Seed: ") + str(self.seed) + "\n"
             if not self.condition() and not log_format: summary_str += "The run is over!\n"
             summary_str += ("population_size = " if log_format else "Population size: ") + str(
                 self.population_size) + "\n"
@@ -1529,7 +1622,9 @@ class Engine:
             summary_str += ("mutation_probs = " if log_format else "Mutations probabilities: ") + "["
             lim = len(self.mutation_probs)
             for m in range(lim):
-                summary_str += str(self.mutation_probs[m])
+                prob_sub = 1 if m == (lim - 1) else self.mutation_probs[m + 1]
+                summary_str += str(prob_sub - self.mutation_probs[m])
+                #summary_str += str(self.mutation_probs[m])
                 if m < lim - 1:
                     summary_str += ", "
             summary_str += "]\n"
@@ -1580,7 +1675,7 @@ class Engine:
                     self.lock_dynamic_limit) + "\n"
                 if not log_format: summary_str += "Dynamic limit: " + str(self.dynamic_limit) + "\n"
 
-        if (population or force_print) and not log_format:
+        if population or (force_print and not log_format):
             summary_str += "\n############# Population Information #############\n"
             summary_str += "Best individual: \n"
             summary_str += ("Not defined" if ('tree' not in self.best) else get_ind_str(self.best,
@@ -1645,6 +1740,7 @@ class Engine:
                 summary_str += "Last saved population: " + str(self.last_stop) + "\n"
                 summary_str += "Function to generate terminal vars: " + get_func_name(self.var_func) + "\n"
             if self.target_expr != 'undefined':  # write the expression instead
+                #summary_str += (("target = " + '"') if log_format else "Target tensor: ") + str(self.target_expr) + ('"' if log_format else "") + "\n"
                 summary_str += ("target = " if log_format else "Target tensor: ") + str(self.target_expr) + "\n"
             else:  # write the tensor
                 if hasattr(self.target, "__module__") and type(self.target).__module__.split(".", 1)[0] == 'tensorflow':
@@ -1654,6 +1750,13 @@ class Engine:
             summary_str += ("minimal_print = " if log_format else "Mininal printing: ") + str(self.minimal_print) + "\n"
             summary_str += ("tf_type = " if log_format else "Internal data type (tensorflow type): ") + str(
                 self.tf_type) + "\n"
+            summary_str += ("reeval_fitness_start = " if log_format else "Reeval Fitness Start: ") + str(self.reeval_fitness_start) + "\n"
+            summary_str += ("reeval_elite = " if log_format else "Reeval Elite: ") + str(self.reeval_elite) + "\n"
+            summary_str += ("_seed_state = " if log_format else "Seed State: ") + str(self.engine_rng.getstate()) + "\n"
+            summary_str += ("interface = " if log_format else "Interface: ") + str(self.interface) + "\n"
+            summary_str += ("fixed_path = " if log_format else "Fixed Path: ") + str(self.fixed_path) + "\n"
+
+
         if log_format: summary_str += "_save_state = " + str(self.save_state) + "\n"
 
         if timers or force_print:
@@ -1668,7 +1771,13 @@ class Engine:
             summary_str += ("last_engine_time = " if log_format else "Total engine time: ") + str(
                 self.elapsed_engine_time) + "\n"
             if not log_format: summary_str += "Last engine update time: " + str(self.last_engine_time) + "\n"
+
         if log_format: summary_str += "_last_engine_time = " + str(self.last_engine_time) + "\n"
+
+        if not self.no_disk: summary_str += ("_work_dir = " if log_format else "Working directory: ") + str(self.experiment.working_directory) + "\n"
+
+        if pop_path is not None:
+            summary_str += ("_last_pop = " if log_format else "Current generation: ") + str(pop_path) + "\n"
 
         if paths or force_print:
             summary_str += "\n############# Paths Information #############\n"
@@ -1681,12 +1790,14 @@ class Engine:
                 self.pop_source) + "\n"
             summary_str += ("exp_prefix = " if log_format else "Experimence prefix: ") + '"' + str(
                 self.experiment.prefix) + '"' + "\n"
+            summary_str += ("start_fitness_file = " if log_format else "Starting Fitness File: ") + str(
+                self.start_fitness_file) + "\n"
 
-        if (experiment or force_print) and not log_format:
+        if (experiment or force_print) and not (not self.no_disk) and (not log_format):
             summary_str += "\n############# Experiment Information #############\n"
             summary_str += self.experiment.summary()
 
-        if write_file:
+        if write_file and (not self.no_disk):
             fn = self.experiment.working_directory if file_path is None else file_path
             fn += file_name
             with open(fn, "w") as text_file:
@@ -1787,6 +1898,7 @@ class Engine:
 
         return max_nodes, Node(value=primitive, terminal=terminal, children=children)
 
+
     def generate_population(self, individuals, method, max_nodes, max_depth, min_depth=-1):
         # print("Entering generate program (min, max)", min_depth, max_depth)
 
@@ -1852,55 +1964,46 @@ class Engine:
 
         return pop_nodes, population
 
+
     def codomain_range(self, final_tensor):
         # 'dynamic' and 'mod' modes normmalize to 0..1
         if self.domain_mode == 'log':
-            final_tensor = tf.math.log(tf.math.abs(final_tensor)) / tf.math.log(tf.constant(10.0, dtype=tf.float32))
+            final_tensor = torch.log(torch.abs(final_tensor)) / torch.log(torch.full_like(final_tensor, 10.0, dtype=torch.float32))
         elif self.domain_mode == 'dynamic':
-            final_tensor = tf.math.abs(final_tensor)
+            final_tensor = torch.abs(final_tensor)
             final_tensor = (final_tensor / (1 + final_tensor))
         elif self.domain_mode == 'mod':
-            final_tensor = tf.math.abs(final_tensor)
-            final_tensor = final_tensor - tf.math.floor(final_tensor)
-        return tf.clip_by_value(final_tensor, clip_value_min=_codomain[0], clip_value_max=_codomain[1])
+            final_tensor = torch.abs(final_tensor)
+            final_tensor = final_tensor - torch.floor(final_tensor)
+        return torch.clip(final_tensor, min=_codomain[0], max=_codomain[1])
+
 
     def domain_mapping(self, tensor):
-        # print("Initial:\n", tensor.numpy())
-        final_tensor = tf.where(tf.math.is_nan(tensor), _domain[0], tensor)
-        # print("T1:\n", final_tensor.numpy())
-        final_tensor = tf.clip_by_value(final_tensor, clip_value_min=tf.float32.min, clip_value_max=tf.float32.max)
-        # print("T2:\n", final_tensor.numpy())
-        final_tensor = self.codomain_range(final_tensor)
-        # print("T3:\n", final_tensor.numpy())
+        final_tensor = torch.where(torch.isnan(tensor), torch.tensor(_domain[0], dtype=dtype, device=cur_dev), tensor)
+        final_tensor = torch.clip(final_tensor, min=torch_dtype_min, max=torch_dtype_max)
+        # ".cuda()" is "temporary fix
+        final_tensor = self.codomain_range(final_tensor).cuda()
 
         if self.do_polar_mask:
-            final_tensor = tf.where(self.polar_mask == 1, final_tensor, self.polar_mask_value)
-        # print("T4:\n", final_tensor.numpy())
+            final_tensor = torch.where(self.polar_mask == 1, final_tensor, self.polar_mask_value)
 
         if self.do_final_transform:
             final_tensor = get_final_transform(final_tensor, _final_transform_delta, _final_transform[0])
-        # print("T5:\n", final_tensor.numpy())
 
         return final_tensor
 
-    # def final_transform_domain(self, final_tensor):
-    #    return final_tensor
 
     def calculate_tensors(self, population):
         tensors = []
-        # with tf.device(self.device):
         start = time.time()
         for p in population:
             # print("Evaluating ind: ", p['tree'].get_str())
             # _start = time.time()
-
-            if isinstance(p['tree'], dict):
-                print("Deb")
-                print(p['tree'])
-
             test_tens = p['tree'].get_tensor(self)
             # tens = self.final_transform_domain(test_tens)
+
             tens = self.domain_mapping(test_tens)
+
             # tens = test_tens
             p['tensor'] = tens
             tensors.append(tens)
@@ -1911,26 +2014,55 @@ class Engine:
         self.recent_tensor_time = time_tensor
         return tensors, time_tensor
 
-    def fitness_func_wrap(self, population, f_path):
+
+    # TODO: test
+    def evaluate_from_expr(self, expr, resolution):
+        _, node = str_to_tree(expr, self.terminal.set)
+        return self.evaluate_from_tree(node, resolution)
+
+
+    def evaluate_from_tree(self, ind, resolution):
+        original_res = self.target_dims
+        self.target_dims = resolution
+        final_tensor = ind.get_tensor(self)
+        self.target_dims = original_res
+        return self.domain_mapping(final_tensor)
+
+
+    def fitness_func_wrap(self, population, f_path=None):
 
         # calculate tensors
-
         if self.debug > 4: print("\nEvaluating generation: " + str(self.current_generation))
-        with tf.device(self.device):
-            tensors, time_taken = self.calculate_tensors(population)
+        #with tf.device(self.device):
+        tensors, time_taken = self.calculate_tensors(population)
         if self.debug > 4: print("Calculated " + str(len(population)) + " tensors in (s): " + str(time_taken))
+
+        # save pop and bests
+        # self.save_pop(population=population)
+
+        # launch interface
+        # self.launch_interface() # feednplay
 
         # calculate fitness
         if self.debug > 4: print("Assessing fitness of individuals...")
         _s = time.time()
+
         # Notes: measuring time should not be up to the fit function writer. We should provide as much info as possible
         # Maybe best pop shouldn't be required
+        if self.no_disk:
+            w_dir = ""
+            f_path = ""
+        else:
+            w_dir = self.experiment.working_directory
+            if f_path is None:
+                f_path = self.experiment.current_directory
 
         population, best_ind = self.fitness_func(generation=self.current_generation,
                                                  population=population,
                                                  tensors=tensors,
                                                  f_path=f_path,
                                                  image_extension=self.image_extension,
+                                                 work_dir = w_dir,
                                                  polar_mask=self.polar_mask,
                                                  rng=self.engine_rng,
                                                  objective=self.objective,
@@ -1942,11 +2074,15 @@ class Engine:
                                                  debug=False if (self.debug == 0) else True)
         fitness_time = time.time() - _s
 
+        # Timers
         self.elapsed_fitness_time += fitness_time
         self.recent_fitness_time = fitness_time
         if self.debug > 4: print("Assessed " + str(len(population)) + " tensors in (s): " + str(fitness_time))
 
+        #print_population(population, best=population[best_ind], print_expr=True, msg="after fit")
+
         return population, population[best_ind]
+
 
     def generate_pop_from_expr(self, strs):
         population = []
@@ -1954,13 +2090,12 @@ class Engine:
         maxpopd = -1
 
         for p in strs:
-            t, node = str_to_tree(p, self.terminal.set)
+            t, node = str_to_tree(p, self.terminal.set, constrain_domain=False)
 
             thisdep, t = node.get_depth()
             if thisdep > maxpopd:
                 maxpopd = thisdep
 
-            # population.append({'tree': node, 'fitness': 0, 'depth': thisdep, 'nodes': t, 'tensor': [], 'valid': True, 'parents':[]})
             population.append(new_individual(node, fitness=0, depth=thisdep, nodes=t))
             if self.debug > 0:
                 print("Number of nodes:\t:" + str(t))
@@ -1970,6 +2105,7 @@ class Engine:
             print("Total number of nodes:\t" + str(nodes_generated))
 
         return population, nodes_generated, maxpopd
+
 
     def generate_pop_from_file(self, read_from_file, pop_size=float('inf')):
         # open population files
@@ -1989,6 +2125,43 @@ class Engine:
         # convert expressions to trees
         return self.generate_pop_from_expr(strs)
 
+
+    def read_fitness_from_file(self, population, sl=1, fitness_row = 2):
+        line_start = sl
+        line_end = len(population) + line_start
+        lcnt = 0
+        best_ind = 0
+
+        # set objective function according to min/max
+        fit = 0
+        if self.objective == 'minimizing':
+            condition = lambda: (fit < max_fit)  # minimizing
+            max_fit = float('inf')
+        else:
+            condition = lambda: (fit > max_fit)  # maximizing
+            max_fit = float('-inf')
+
+        with open(self.start_fitness_file, mode='r') as csv_file:
+            csv_reader = csv.reader(csv_file)
+            for row in csv_reader:
+                if line_start <= lcnt < line_end:
+                    fit = float(row[fitness_row])
+                    population[lcnt - 1]['fitness'] = fit
+                    if condition():
+                        max_fit = fit
+                        best_ind = lcnt - 1
+                lcnt += 1
+
+        return population, population[best_ind]
+
+
+    def launch_interface(self):
+        if self.interface and (not self.active_interface):
+            self.active_interface = True
+            cmd_list = ["processing-java", "--sketch=" + os.getcwd() + _tgp_delimiter + "evolver" + _tgp_delimiter, "--run", self.experiment.all_directory]
+            subprocess.Popen(cmd_list)
+
+
     def initialize_population(self, max_depth=8, min_depth=-1, individuals=100, method='ramped half-and-half',
                               max_nodes=-1, read_from=None):
         start_init_population = time.time()
@@ -1997,7 +2170,7 @@ class Engine:
         else:
 
             maxpopd = -1
-            if isinstance(read_from, str) and ".txt" in read_from:  # read from file
+            if isinstance(read_from, str) and (".txt"  in read_from) or (".csv" in read_from):  # read from file
                 population, nodes_generated, maxpopd = self.generate_pop_from_file(read_from_file=read_from,
                                                                                    pop_size=self.population_size)
             elif isinstance(read_from, list):  # generate from list of strs
@@ -2006,7 +2179,7 @@ class Engine:
 
             else:  # give warning generate randomly
                 print(bcolors.FAIL + "[ERROR]:\tCould not read from source: " + str(
-                    read_from) + ", not a list of strinmgs and not a file, randomly generating population instead.",
+                    read_from) + ", not a list of strings and not a file, randomly generating population instead.",
                       bcolors.ENDC)
                 read_from = None
                 nodes_generated, population = self.generate_population(individuals, method, max_nodes, max_depth,
@@ -2026,7 +2199,20 @@ class Engine:
             print("Generated Population: ")
             self.print_population(population)
 
-        population, best_pop = self.fitness_func_wrap(population=population, f_path=self.experiment.cur_image_directory)
+        #print("Evaluating ", str(len(population)), " individuals in initialization pop gen.", str(self.current_generation))
+
+        flag_fitness = False
+        if (self.start_fitness_file is not None) and self.reeval_fitness_start:
+            print(bcolors.WARNING + "Reading initial population fitness from file: " + str(self.start_fitness_file) + bcolors.ENDC)
+            try:
+                population, best_pop = self.read_fitness_from_file(population)
+                flag_fitness = True
+            except FileNotFoundError:
+                print(bcolors.FAIL + "[ERROR]:\tStarting fitness file not found: " + str(self.start_fitness_file) + bcolors.ENDC)
+                flag_fitness = False # technically not needed
+        if not flag_fitness: population, best_pop = self.fitness_func_wrap(population=population)
+
+
         total_time = self.recent_fitness_time + self.recent_tensor_time
 
         if self.debug > 1:  # print detailed method info
@@ -2044,25 +2230,40 @@ class Engine:
 
         return population, best_pop
 
+
     def write_pop_to_csv(self, fp=None):
-        if self.can_save_log():
+        if self.can_save_log() and not self.no_disk:
             genstr = "gen" + str(self.current_generation).zfill(5)
+            popstr = "pop" + str(self.current_generation).zfill(5)
             fn = self.experiment.generations_directory if fp is None else fp
+
+            fg = fn + genstr + ".csv"
+            fnp = fn + popstr + ".csv"
+
             # write engine summary
             self.summary(force_print=True, log_format=True, write_file=True,
-                         file_path=self.experiment.working_directory, file_name='state.log')
+                         file_path=self.experiment.working_directory,
+                         file_name='state.log',
+                         pop_path=fnp)
+
+            # save seed state
+            state = self.engine_rng.getstate()
+            #print("Kwargs seed state ", state)
+            state_fp = self.experiment.current_directory + save_seed_file
+            with open(state_fp, 'wb') as seed_file:
+                pickle.dump(state, seed_file)
 
             # write information of generation
-            fn += genstr + ".csv"
-            with open(fn, mode='w', newline='') as file:
-                fwriter = csv.writer(file, delimiter=',')
+            with open(fg, mode='w', newline='') as g_file, open(fnp, mode='w', newline='') as p_file:
+                g_fwriter = csv.writer(g_file, delimiter=',')
+                p_fwriter = csv.writer(p_file, delimiter = ',')
                 ind = 0
                 for p in self.population:
                     if ind == 0:
-                        file.write("individual number, individual name, fitness, depth, number nodes, expression\n")
-                    fwriter.writerow(
-                        [str(ind), genstr + "_indiv_" + str(ind).zfill(5), p['fitness'], p['depth'], p['nodes'],
-                         p['tree'].get_str()])
+                        g_file.write("individual_number,individual_name,fitness,depth,number_nodes,expression\n")
+                    g_fwriter.writerow(
+                        [str(ind), genstr + "_indiv_" + str(ind).zfill(5), p['fitness'], p['depth'], p['nodes']])
+                    p_fwriter.writerow([p['tree'].get_str()])
                     ind += 1
 
     def population_stats(self, population, fitness=True, depth=True, nodes=True):
@@ -2084,7 +2285,7 @@ class Engine:
 
     def generate_pop_images(self, expressions, fpath=None):
         fp = self.experiment.current_directory if fpath is None else fpath
-        # tensors = []
+
         if isinstance(expressions, str):
             pop, number_nodes, max_dep = self.generate_pop_from_file(expressions)
             tensors, time_taken = self.calculate_tensors(pop)
@@ -2098,12 +2299,14 @@ class Engine:
         else:
             print(bcolors.FAIL + "[ERROR]:\tTo generate images from a population please enter either"
                                  " a file or a list with the corresponding expressions." + bcolors.ENDC)
-            return
+            return None
         index = 0
         for p in pop:
             t = p['tensor']
             save_image(t, index, fp, self.target_dims, BGR=self.do_bgr, extension=self.image_extension)
             index += 1
+        return tensors
+
 
     # and ((node_p1.value != 'scalar') or (node_p1.children == node_p2.children)):
 
@@ -2138,17 +2341,17 @@ class Engine:
         if (start_from_last_pop is False) or (start_from_last_pop is True):
             start_from_last_pop *= self.population_size
         start_from_last_pop = clamp(0, start_from_last_pop, self.population_size)
-        if self.save_state == 0:
+
+        if (self.save_state == 0) or (len(self.population) == 0):
             start_from_last_pop = 0
 
+        #print(start_from_last_pop)
         # either generate initial pop randomly or read fromfile along with remaining experiment data
         self.data = []
 
-        if len(self.population) == 0:
-            start_from_last_pop = 0
-
-        if start_from_last_pop < self.population_size or self.save_state == 0:  # ===== start if =====
-            self.experiment.set_generation_directory(self.current_generation, self.can_save_image_pop)
+        if start_from_last_pop < self.population_size or self.save_state == 0:
+            if not self.no_disk:
+                self.experiment.set_generation_directory(self.current_generation, self.can_save_image_pop)
 
             population, best = self.initialize_population(max_depth=self.max_init_depth,
                                                           min_depth=self.min_init_depth,
@@ -2156,18 +2359,6 @@ class Engine:
                                                           method=self.method,
                                                           max_nodes=self.max_nodes,
                                                           read_from=self.pop_source)
-            """
-            if start_from_last_pop > 0:
-                if self.objective == 'minimizing':
-                    meta_elite = nsmallest(start_from_last_pop, self.population, key=itemgetter('fitness'))
-                    if meta_elite[0]['fitness'] < best['fitness']:
-                        best = meta_elite[0]
-                else:
-                    meta_elite = nlargest(start_from_last_pop, self.population, key=itemgetter('fitness'))
-                    if meta_elite[0]['fitness'] > best['fitness']:
-                        best = meta_elite[0]
-                population += meta_elite
-            """
 
             if start_from_last_pop > 0:
                 meta_elite = self.get_n_best_from_pop(population=self.population, n=start_from_last_pop)
@@ -2184,12 +2375,14 @@ class Engine:
                 self.print_population(population=population, minimal=False)
             # print("tournament size: " + str(self.tournament_size))
 
-            # save pop and bests
-            self.save_pop_and_bests(population=self.population)
+            # save bests
+            self.save_best()
+
 
             # write first gen data
             self.write_pop_to_csv(self.pop_file_path)
             self.save_bests_log()
+
             if self.debug > 2:
                 self.summary(force_print=True)
 
@@ -2213,26 +2406,29 @@ class Engine:
 
             self.current_generation += 1
 
-        # ===== end if =====
 
         # Save engine state to file
-        self.save_engine_state()
+        #self.save_engine_state()
 
         while self.condition():
 
-            # Update seed according to generation
-            self.engine_rng = random.Random(self.experiment.seed)
-
             # Set directory to save engine state in this generation
-            self.experiment.set_generation_directory(self.current_generation, self.can_save_image_pop)
+            if not self.no_disk:
+                self.experiment.set_generation_directory(self.current_generation, self.can_save_image_pop)
 
             # TODO: immigrate individuals (archive)
 
             # Create new population of individuals
+
             new_population = self.get_n_best_from_pop(population=self.population, n=self.elitism)
+
+            #print_population(new_population, best=None, print_expr=True, msg="after new_pop")
 
             temp_population = []
             retrie_cnt = []
+
+            #print_population(self.population, best=self.best, print_expr=True, msg="before torunament")
+
             for current_individual in range(self.population_size - self.elitism):
 
                 rcnt = 0
@@ -2266,10 +2462,6 @@ class Engine:
                 print("[DEBUG]:\tAverage evolutionary ops retries for generation " + str(
                     self.current_generation) + ": " + str(rstd))
 
-            # calculate fitness of the new population
-            temp_population, temp_best = self.fitness_func_wrap(population=temp_population,
-                                                                f_path=self.experiment.current_directory)
-
             # bloat control:
             #
             # off        - min_tree_depth < depth < max_tree_depth
@@ -2284,12 +2476,31 @@ class Engine:
             #
             # https://www.researchgate.net/publication/220286086_Dynamic_limits_for_bloat_control_in_genetic_programming_and_a_review_of_past_and_current_bloat_theories
 
+
             if self.bloat_control == "off":
                 # for current_individual in range(self.population_size - self.elitism):
                 #    ind = temp_population[current_individual]
                 #    new_population.append(ind)
-                new_population += temp_population
+
+                if self.reeval_elite:
+                    new_population += temp_population
+                    if len(new_population) > 0:
+                        new_population, _ = self.fitness_func_wrap(population=new_population)
+                else:
+                    if len(temp_population) > 0:
+                        temp_population, _ = self.fitness_func_wrap(population=temp_population)
+                    new_population += temp_population
+
             else:
+
+                if len(temp_population) > 0:
+                    temp_population, _ = self.fitness_func_wrap(population=temp_population)
+
+                # force reevaluation of elite (for example when fitness func is dynamic)
+                if self.reeval_elite and len(new_population) > 0:
+                    new_population, _ = self.fitness_func_wrap(population=new_population)
+
+
                 accepted = 0
                 depth_mode = self.bloat_mode == 'depth'
                 best_fit = self.best_overall['fitness']
@@ -2356,16 +2567,18 @@ class Engine:
                     if not ind['valid']:
                         illegals += 1
 
+
             # update population
             self.population = new_population
 
             # update best gen and overall
             self.best = self.get_n_best_from_pop(population=self.population, n=1)[0]
+            #print_population([self.best], best=None, print_expr=True, msg="saving best")
+
             if self.condition_overall(self.best['fitness']):
                 self.best_overall = self.deep_shallow_copy(self.best)
 
-            # save pop and bests
-            self.save_pop_and_bests(population=self.population)
+            self.save_best()
 
             # update engine time
             self.update_engine_time()
@@ -2383,10 +2596,6 @@ class Engine:
 
             # if self.save_state == 0: self.print_population(self.population, minimal = True)
 
-            # save engine state
-            # if self.save_to_file != 0 and (self.current_generation % self.save_to_file) == 0:
-            # self.save_state_to_file(self.experiment.logging_directory)
-            self.save_engine_state()
 
             # add population data to statistics and display gen statistics
             pops = self.population_stats(self.population)
@@ -2407,13 +2616,18 @@ class Engine:
 
             # advance generation
             self.current_generation += 1
-            self.experiment.seed += 1
+            #self.seed += 1
+
+            # save engine state
+            # if self.save_to_file != 0 and (self.current_generation % self.save_to_file) == 0:
+            # self.save_state_to_file(self.experiment.logging_directory)
+            #self.save_engine_state()
 
         # write statistics(data) to csv
         self.write_overall_to_csv(self.data)
 
         # Write final enggine state to file
-        self.save_engine_state()
+        # self.save_engine_state()
 
         # save best overall image to top level
         if self.can_save_image_best():
@@ -2444,12 +2658,13 @@ class Engine:
         tensors = [p['tensor'] for p in self.population]
         return self.data, tensors
 
+
     def set_polar_mask_value(self):
         if self.do_polar_mask:
             polar_mask_value = self.polar_mask_value
             if hasattr(polar_mask_value, "__module__"):
                 if type(polar_mask_value).__module__ == 'numpy':
-                    self.polar_mask_value = tf.convert_to_tensor(polar_mask_value)
+                    self.polar_mask_value = torch.Tensor(polar_mask_value)
             else:
                 if isinstance(polar_mask_value, float):
                     mask_expr = "scalar(" + str(clamp(_codomain[0], polar_mask_value, _codomain[1])) + ")"
@@ -2469,9 +2684,10 @@ class Engine:
                     mask_expr = "scalar(" + str(_codomain[0]) + ")"
 
                 _, tt = str_to_tree(mask_expr, self.terminal.set, constrain_domain=False)
-                with tf.device(self.device):
-                    self.polar_mask_value = tf.cast(tt.get_tensor(self), tf.float32)
+                tt_temp = tt.get_tensor(self)
+                self.polar_mask_value = tt_temp.type(torch.float32)
                 self.polar_mask_value_expr = mask_expr
+
 
     def selection(self):
         parent = self.tournament_selection()
@@ -2490,14 +2706,8 @@ class Engine:
         if random_n2 < self.mutation_rate:
             indiv_temp = self.mutation(parent['tree'])
 
-        # if indiv_temp
-        # print("mut")
-        # if random_n1 >= self.crossover_rate and random_n2 >= self.crossover_rate:
-        # indiv_temp = parent['tree']
-        # print("repro")
-        # print("Indiv temp dep: ", indiv_temp.get_depth(), " with str: ", indiv_temp.get_str())
-
         return indiv_temp, parent, plist
+
 
     def get_n_best_from_pop(self, population, n):
         if self.objective == 'minimizing':
@@ -2506,12 +2716,14 @@ class Engine:
             elite = nlargest(n, population, key=itemgetter('fitness'))
         return elite
 
-    def save_pop_and_bests(self, population):
+    def save_best(self):
         if self.can_save_image_best():
             # Save Best Image
             fn = self.experiment.bests_directory + "best_gen" + str(self.current_generation).zfill(5)
             save_image(self.best['tensor'], 0, fn, self.target_dims, BGR=self.do_bgr,
                        extension=self.image_extension)
+
+    def save_pop(self, population):
 
         if self.can_save_image_pop():
             # Save Population Images
@@ -2520,6 +2732,11 @@ class Engine:
                     fn = self.experiment.cur_image_directory + "gen" + str(self.current_generation).zfill(5)
                     save_image(population[i]['tensor'], i, fn, self.target_dims, BGR=self.do_bgr,
                                extension=self.image_extension)
+
+            # Remove file if it exists
+            if os.path.exists(self.flag_file):
+                os.remove(self.flag_file)
+
 
     def graph_statistics(self, extension=".pdf"):
 
@@ -2540,19 +2757,19 @@ class Engine:
         std_dep = []
         best_dep = []
         lcnt = 1
-
-        with open(self.experiment.overall_fp, mode='r') as csv_file:
-            csv_reader = csv.reader(csv_file)
-            for row in csv_reader:
-                if self.debug > 10: print(row)
-                if line_start <= lcnt < line_end:
-                    avg_fit.append(float(row[1]))
-                    std_fit.append(float(row[2]))
-                    best_fit.append(float(row[4]))  # overall
-                    avg_dep.append(float(row[5]))
-                    std_dep.append(float(row[6]))
-                    best_dep.append(float(row[8]))  # overall
-                lcnt += 1
+        if not self.no_disk:
+            with open(self.experiment.overall_fp, mode='r') as csv_file:
+                csv_reader = csv.reader(csv_file)
+                for row in csv_reader:
+                    if self.debug > 10: print(row)
+                    if line_start <= lcnt < line_end:
+                        avg_fit.append(float(row[1]))
+                        std_fit.append(float(row[2]))
+                        best_fit.append(float(row[4]))  # overall
+                        avg_dep.append(float(row[5]))
+                        std_dep.append(float(row[6]))
+                        best_dep.append(float(row[8]))  # overall
+                    lcnt += 1
 
         # showing best overall
         fig, ax = plt.subplots(1, 1)
@@ -2568,8 +2785,7 @@ class Engine:
         ax.get_yaxis().set_major_formatter(mticker.ScalarFormatter())
         ax.set_title('Fitness across generations')
         fig.set_size_inches(12, 8)
-        plt.savefig(fname=self.experiment.graphs_directory + 'Fitness_ ' + self.experiment.filename + '.' + extension,
-                    format=extension)
+        if not self.no_disk: plt.savefig(fname=self.experiment.graphs_directory + 'Fitness_ ' + self.experiment.filename + '.' + extension, format=extension)
         if self.show_graphics: plt.show()
         plt.close(fig)
 
@@ -2583,36 +2799,37 @@ class Engine:
         ax.get_yaxis().set_major_formatter(mticker.ScalarFormatter())
         ax.set_title('Avg depth across generations')
         fig.set_size_inches(12, 8)
-        plt.savefig(fname=self.experiment.graphs_directory + 'Depth_' + self.experiment.filename + '.' + extension,
-                    format=extension)
+        if not self.no_disk:  plt.savefig(fname=self.experiment.graphs_directory + 'Depth_' + self.experiment.filename + '.' + extension, format=extension)
         if self.show_graphics: plt.show()
         plt.close(fig)
 
-    def write_overall_to_csv(self, data):
-        # evolutionary stats across generations
-        fn = (
-                self.experiment.working_directory + "evolution_" + self.experiment.filename + ".csv") if self.experiment.overall_fp is None else self.experiment.overall_fp
-        with open(fn, mode='a', newline='') as file:
-            fwriter = csv.writer(file, delimiter=',')
-            ind = 0
-            for d in data:
-                if ind == 0 and self.save_state == 0:
-                    file.write(
-                        "generation, fitness avg, fitness std, fitness generational best, fitness overall best," \
-                        "depth avg, depth std, depth generational best, depth overall best," \
-                        "node avg, node std, node generational best, node overall best," \
-                        "generation time, fitness time, tensor time\n")
-                fwriter.writerow(d)
-                ind += 1
 
-        fn = (
-                self.experiment.working_directory + "timings_" + self.experiment.filename + ".csv") if self.experiment.timings_fp is None else self.experiment.timings_fp
-        with open(fn, mode='a', newline='') as file:
-            fwriter = csv.writer(file, delimiter=',')
-            if self.save_state == 0:
-                file.write("resolution, seed, initialization time, tensor time, fitness time, total, engine time\n")
-            fwriter.writerow([self.target_dims[0], self.experiment.seed, self.elapsed_init_time,
-                              self.elapsed_tensor_time, self.elapsed_fitness_time, self.elapsed_engine_time])
+    def write_overall_to_csv(self, data):
+        if self.can_save_log() and not self.no_disk:
+            # evolutionary stats across generations
+            fn = (
+                    self.experiment.working_directory + "evolution_" + self.experiment.filename + ".csv") if self.experiment.overall_fp is None else self.experiment.overall_fp
+            with open(fn, mode='a', newline='') as file:
+                fwriter = csv.writer(file, delimiter=',')
+                ind = 0
+                for d in data:
+                    if ind == 0 and self.save_state == 0:
+                        file.write(
+                            "generation,fitness_avg,fitness_std,fitness_generational_best,fitness_overall_best," \
+                            "depth_avg,depth_std,depth_generational_best,depth_overall_best," \
+                            "node_avg,node_std,node_generational_best,node_overall_best," \
+                            "generation_time,fitness_time,tensor_time\n")
+                    fwriter.writerow(d)
+                    ind += 1
+
+            fn = (
+                    self.experiment.working_directory + "timings_" + self.experiment.filename + ".csv") if self.experiment.timings_fp is None else self.experiment.timings_fp
+            with open(fn, mode='a', newline='') as file:
+                fwriter = csv.writer(file, delimiter=',')
+                if self.save_state == 0:
+                    file.write("resolution,seed,initialization_time,tensor_time,fitness_time,total,engine_time\n")
+                fwriter.writerow([self.target_dims[0], self.seed, self.elapsed_init_time,
+                                  self.elapsed_tensor_time, self.elapsed_fitness_time, self.elapsed_engine_time])
 
     def update_engine_time(self):
         t_ = time.time()
@@ -2634,7 +2851,7 @@ class Engine:
         if self.save_bests:
             with open(self.experiment.bests_fp, "a") as csv_file:
                 try:
-                    if self.current_generation == 0: csv_file.write("generation, index, expression\n")
+                    if self.current_generation == 0: csv_file.write("generation,index,expression\n")
                     writer = csv.writer(csv_file)
                     writer.writerow([self.current_generation, self.best['fitness'], self.best['tree'].get_str()])
                 except IOError as error:
@@ -2644,7 +2861,7 @@ class Engine:
         if self.save_bests_overall:
             with open(self.experiment.bests_overall_fp, "a") as csv_file:
                 try:
-                    if self.current_generation == 0: csv_file.write("generation, index, expression\n")
+                    if self.current_generation == 0: csv_file.write("generation,index,expression\n")
                     writer = csv.writer(csv_file)
                     writer.writerow(
                         [self.current_generation, self.best_overall['fitness'], self.best_overall['tree'].get_str()])
@@ -2671,7 +2888,7 @@ class Engine:
             if not self.condition(): print("The run is over!")
 
             print("\nGeneral Info:")
-            print("Engine Seed:\t" + str(self.experiment.seed))
+            print("Engine Seed:\t" + str(self.seed))
             print("Engine ID:\t" + str(self.experiment.ID))
             print("Generation:\t" + str(self.current_generation))
 
@@ -2711,37 +2928,36 @@ class Function_Set:
         self.max_arity = 0
 
         self.operators_def = {  # arity, function
-            'abs': [1, resolve_abs_node],
-            'add': [2, resolve_add_node],
-            'and': [2, resolve_and_node],
-            'clip': [3, resolve_clip_node],
-            'cos': [1, resolve_cos_node],
-            'div': [2, resolve_div_node],
-            'exp': [1, resolve_exp_node],
-            'frac': [1, resolve_frac_node],
-            'if': [3, resolve_if_node],
-            'len': [2, resolve_len_node],
-            'lerp': [3, resolve_lerp_node],
-            # 'lerpp': [3, resolve_lerp_node],
-            'log': [1, resolve_log_node],
-            'max': [2, resolve_max_node],
-            'mdist': [2, resolve_mdist_node],
-            'min': [2, resolve_min_node],
-            'mod': [2, resolve_mod_node],
-            'mult': [2, resolve_mult_node],
-            'neg': [1, resolve_neg_node],
-            'or': [2, resolve_or_node],
-            'pow': [2, resolve_pow_node],
-            'sign': [1, resolve_sign_node],
-            'sin': [1, resolve_sin_node],
-            'sqrt': [1, resolve_sqrt_node],
-            'sstep': [1, resolve_sstep_node],
-            'sstepp': [1, resolve_sstepp_node],
-            'step': [1, resolve_step_node],
-            'sub': [2, resolve_sub_node],
-            'tan': [1, resolve_tan_node],
-            'warp': [edim + 1, resolve_warp_node],
-            'xor': [2, resolve_xor_node],
+            'abs': [1, node_abs],
+            'add': [2, node_add],
+            'and': [2, node_bit_and],
+            'clip': [3, node_clip],
+            'cos': [1, node_cos],
+            'div': [2, node_div],
+            'exp': [1, node_exp],
+            'frac': [1, node_frac],
+            'if': [3, node_if],
+            'len': [2, node_len],
+            'lerp': [3, node_lerp],
+            'log': [1, node_log],
+            'max': [2, node_max],
+            'mdist': [2, node_mdist],
+            'min': [2, node_min],
+            'mod': [2, node_mod],
+            'mult': [2, node_mul],
+            'neg': [1, node_neg],
+            'or': [2, node_bit_or],
+            'pow': [2, node_pow],
+            'sign': [1, node_sign],
+            'sin': [1, node_sin],
+            'sqrt': [1, node_sqrt],
+            'sstep': [1, node_sstep],
+            'sstepp': [1, node_sstepp],
+            'step': [1, node_step],
+            'sub': [2, node_sub],
+            'tan': [1, node_tan],
+            # 'warp': [edim + 1, node_warp],
+            'xor': [2, node_bit_xor],
         }
 
         if fset is None:
@@ -2832,15 +3048,16 @@ def clamp(x, n, y):
     return max(min(n, y), x)
 
 
-def uniform_sampling(res, minval=_domain[0], maxval=_domain[1]):
-    return tf.random.uniform(res, minval=minval, maxval=maxval)
+def uniform_sampling(res, minval = _domain[0], maxval = _domain[1]):
+    delta = maxval - minval
+    return torch.add(torch.mul(torch.rand(res), delta), minval)
 
 
 # engref optional to allow for independent set creation
 # when calling inside the engine, we will provide the engine ref itself to allow terminal definition by expressions
 class Terminal_Set:
 
-    def __init__(self, effective_dim, resolution, function_ptr_to_var_node=resolve_var_node, debug=0, engref=None):
+    def __init__(self, effective_dim, resolution, function_ptr_to_var_node=node_var, debug=0, engref=None):
         self.debug = debug
         self.engref = engref
         self.dimension = resolution[effective_dim] if (effective_dim < len(resolution)) else 1
@@ -2853,10 +3070,10 @@ class Terminal_Set:
                 y = self.set['y']
                 y = y * - 1
                 xy_dist = x ** 2 + y ** 2
-                self.set['x'] = tf.math.abs(tf.math.atan2(x, y))
-                self.set['y'] = tf.math.sqrt(xy_dist)
+                self.set['x'] = torch.atan2(x, y) / math.pi
+                self.set['y'] = torch.sqrt(xy_dist) * 2 - 1
                 if self.engref.do_polar_mask:
-                    self.engref.polar_mask = tf.where(xy_dist > 1, 0, 1)
+                    self.engref.polar_mask = torch.where(xy_dist > 1, 0, 1)
         else:
             self.set = {}
 
@@ -2903,7 +3120,7 @@ class Terminal_Set:
                 _, tree = str_to_tree(t, self.set)
                 tensor = tree.get_tensor(engref)
         elif hasattr(t, "__module__") and type(t).__module__ == 'numpy':
-            tensor = tf.convert_to_tensor(t)
+            tensor = torch.Tensor(t)
         else:
             tensor = t
 
