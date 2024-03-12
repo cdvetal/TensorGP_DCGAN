@@ -1,4 +1,11 @@
-from tensorgp.engine import *
+from tensorgp.engine_tf import *
+
+import torch
+import torch.nn as nn
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -36,6 +43,56 @@ std_set = {'add', 'sub', 'mult', 'div', 'sin', 'cos', 'min', 'max', 'abs', 'neg'
 cnn_model = load_model('MNIST_keras_CNN.h5')
 dpi = 96
 
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        D_HIDDEN = 64
+        self.main = nn.Sequential(
+            # 1st layer
+            nn.Conv2d(1, D_HIDDEN, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            # 2nd layer
+            nn.Conv2d(D_HIDDEN, D_HIDDEN * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(D_HIDDEN * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            # 3rd layer
+            nn.Conv2d(D_HIDDEN * 2, D_HIDDEN * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(D_HIDDEN * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            # 4th layer
+            nn.Conv2d(D_HIDDEN * 4, D_HIDDEN * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(D_HIDDEN * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            # output layer
+            nn.Conv2d(D_HIDDEN * 8, 1, 1, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+        """
+        # normal
+        nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1,1), padding_mode='zeros', bias=False), # change channels to 3 for color
+        nn.LeakyReLU(0.2, inplace=True),
+        # downsample
+        nn.Conv2d(64, 128, kernel_size=(3, 3), stride=(2, 2), padding_mode='zeros', bias=False),
+        nn.LeakyReLU(0.2, inplace=True),
+        # downsample
+        nn.Conv2d(128, 128, kernel_size=(3, 3), stride=(2, 2), padding_mode='zeros', bias=False),
+        nn.LeakyReLU(0.2, inplace=True),
+        # downsample
+        nn.Conv2d(128, 256, kernel_size=(3, 3), stride=(2, 2), padding_mode='zeros', bias=False),
+        nn.LeakyReLU(0.2, inplace=True),
+        # classifier
+        #nn.Flatten(),
+        #nn.Dropout(p=0.5),
+        #nn.Linear()
+        nn.Conv2d(256, 1, kernel_size=(3, 3), stride=(1, 1), padding_mode='zeros', bias=False),
+        nn.Sigmoid()
+        """
+
+    def forward(self, input):
+        return self.main(input).view(-1, 1).squeeze(1)
+
+
 class dcgan(object):
 
     def __init__(self,
@@ -45,7 +102,7 @@ class dcgan(object):
                  archive_stf = 1,
                  starchive = 1,
                  do_archive = False,
-                 digits_to_train=None,
+                 classes_to_train=None,
                  run_from_last_pop=True,
                  linear_gens_per_batch=False,
                  log_losses=True,
@@ -58,7 +115,7 @@ class dcgan(object):
                  archive_dir=None):
 
         self.seed = seed
-        tf.random.set_seed(self.seed)
+        torch.manual_seed(seed)
 
         self.img_rows = 28
         self.img_cols = 28
@@ -85,12 +142,21 @@ class dcgan(object):
         self.gens_per_batch = gens_per_batch
         self.last_gen_imgs = []
 
-        self.cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-        self.discriminator = self.make_discriminator_model()
-        self.disc_optimizer = tf.keras.optimizers.Adam(1e-4)
         resolution = [self.img_rows, self.img_cols]
         self.fset = normal_set if fset is None else fset
         stop_value = self.gens_per_batch - 1 if self.linear_gens_per_batch else 4
+
+
+        #torch stuff
+        torch.manual_seed(seed)
+        CUDA = torch.cuda.is_available()
+        if CUDA: torch.cuda.manual_seed(seed)
+        self.device = torch.device("cuda:0" if CUDA else "cpu")
+        self.discriminator = Discriminator().to(self.device)
+        self.discriminator.apply(self.weights_init)
+        print("Discriminator network: ", self.discriminator)
+        self.cross_entropy = nn.BCELoss()
+        self.disc_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=0.0002, betas=(0.5, 0.999))
 
 
         self.generator = Engine(fitness_func=self.disc_forward_pass,
@@ -102,7 +168,7 @@ class dcgan(object):
                                 target_dims=resolution,
                                 method='ramped half-and-half',
                                 objective='maximizing',
-                                device='/gpu:0',
+                                device='cpu',
                                 stop_criteria='generation',
                                 domain_mode='log',
                                 operators=self.fset,
@@ -162,12 +228,29 @@ class dcgan(object):
         self.loss_hist = []
 
         # sieve classes
-        self.digits_to_train = digits_to_train if digits_to_train is not None else [i for i in range(10)]
+        self.classes_to_train = classes_to_train if classes_to_train is not None else [i for i in range(10)]
+
+        self.dataset = dset.MNIST(root='./data', download=True,
+                             transform=transforms.Compose([
+                                 #transforms.Resize(64), # is resizing
+                                 transforms.ToTensor(),
+                                 transforms.Normalize((127.5,), (127.5,)) # normalize to -1, 1
+                             ]))
+        train_mask = np.isin(self.dataset.targets, self.classes_to_train)
+        #indices = dataset.targets == 5  # if you want to keep images with the label 5
+        self.dataset.data, self.dataset.targets = self.dataset.data[train_mask], self.dataset.targets[train_mask]
+        self.dataset.data, self.dataset.targets = self.dataset.data[:64], self.dataset.targets[:64]  # testing purposes
+        self.dataloader = torch.utils.data.DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
+
+
+
+
+        """
         (self.x_train, y_train), (_, _) = tf.keras.datasets.mnist.load_data()
         print(y_train)
         print(self.x_train.shape)
         print(y_train.shape)
-        train_mask = np.isin(y_train, self.digits_to_train)
+        train_mask = np.isin(y_train, self.classes_to_train)
         self.x_train = self.x_train[train_mask]
         #self.x_train = self.x_train[:64] # testing purposes
 
@@ -177,6 +260,15 @@ class dcgan(object):
         print("Len of selected dataset: ", len(self.x_train))
         self.x_train = tf.data.Dataset.from_tensor_slices(self.x_train).shuffle(len(self.x_train)).batch(self.batch_size)
         #print(self.x_train.shape)
+        """
+
+    def weights_init(self, m):
+        classname = m.__class__.__name__
+        if classname.find('Conv') != -1:
+            m.weight.data.normal_(0.0, 0.02)
+        elif classname.find('BatchNorm') != -1:
+            m.weight.data.normal_(1.0, 0.02)
+            m.bias.data.fill_(0)
 
 
     def disc_forward_pass(self, **kwargs):
@@ -192,10 +284,14 @@ class dcgan(object):
         best_ind = 0
         tensors = [p['tensor'] for p in population]
 
-        fit_array = self.discriminator(np.array(np.expand_dims(tensors, axis=3)), training=False)
+        #fit_array = self.discriminator(np.array(np.expand_dims(tensors, axis=self.last_axis)), training=False)
+        #fit_array = self.discriminator(np.array(np.expand_dims(tensors, axis=2)), training=False)
+
+        fit_array = self.discriminator(torch.from_numpy(np.expand_dims(tensors, axis=1)).type(torch.FloatTensor)).view(-1)
+
         # scores
         for index in range(len(tensors)):
-            fit = float(fit_array[index][0])
+            fit = float(fit_array[index].item())
 
             if fit > max_fit:
                 max_fit = fit
@@ -205,25 +301,16 @@ class dcgan(object):
 
         return population, best_ind
 
-    def make_discriminator_model(self):
-        model = tf.keras.Sequential()
-        model.add(layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=self.input_shape))
-        model.add(layers.LeakyReLU())
-        model.add(layers.Dropout(0.3))
-        model.add(layers.Conv2D(128, (5, 5), strides=(2, 2), padding='same'))
-        model.add(layers.LeakyReLU())
-        model.add(layers.Dropout(0.3))
 
-        model.add(layers.Flatten())
-        model.add(layers.Dense(1))
-        return model
 
     def compute_losses(self, gen_output, real_output):
-        gen_loss = self.cross_entropy(tf.zeros_like(gen_output), gen_output)
-        real_loss = self.cross_entropy(tf.ones_like(real_output), real_output)
+        gen_loss = self.cross_entropy(torch.zeros_like(gen_output), gen_output)
+        real_loss = self.cross_entropy(torch.ones_like(real_output), real_output)
+        gen_loss.backward()
+        real_loss.backward()
         self.dloss = gen_loss + real_loss
         self.gloss = -self.dloss
-        self.loss_hist.append([self.dloss.numpy(), self.gloss.numpy()])
+        self.loss_hist.append([self.dloss.item(), self.gloss.item()])
 
     def print_training_hist(self):
         for h in self.loss_hist:
@@ -236,46 +323,56 @@ class dcgan(object):
         global gen_image_cnt, fake_image_cnt
         fake_image_cnt += len(images)
 
-        with tf.GradientTape() as disc_tape:
-            ep = self.gens_per_batch if self.linear_gens_per_batch else round(step / 10) + 5
-            starchive = self.starchive if step == 0 else 0
-            gen_image_cnt += self.batch_size * ep
-            #print("Startb form last pop: ", self.run_from_last_pop)
-            _, generated_images = self.generator.run(stop_value=ep,
-                                                    start_from_last_pop=self.run_from_last_pop,
-                                                    #start_from_archive = starchive,
-                                                    #archive = self.archive
-                                                    )
+        ep = self.gens_per_batch if self.linear_gens_per_batch else round(step / 10) + 5
+        starchive = self.starchive if step == 0 else 0
+        gen_image_cnt += self.batch_size * ep
+        #print("Startb form last pop: ", self.run_from_last_pop)
+        _, generated_images = self.generator.run(stop_value=ep,
+                                                start_from_last_pop=self.run_from_last_pop,
+                                                #start_from_archive = starchive,
+                                                #archive = self.archive
+                                                )
 
 
-            # rollling archive
-            if self.do_archive:
-                get_pop = [copy.deepcopy(p) for p in self.generator.population]
-                self.archive = nlargest(min(self.archive_size, self.generator.population_size + len(self.archive)), self.archive + get_pop, key=itemgetter('fitness'))
+        # rollling archive
+        if self.do_archive:
+            get_pop = [copy.deepcopy(p) for p in self.generator.population]
+            self.archive = nlargest(min(self.archive_size, self.generator.population_size + len(self.archive)), self.archive + get_pop, key=itemgetter('fitness'))
 
-            # tf.debugging.assert_greater_equal(generated_images, -1.0, message="Less than min domain!")
-            # tf.debugging.assert_less_equal(generated_images, 1.0, message="Grater than max domain!")
+        # tf.debugging.assert_greater_equal(generated_images, -1.0, message="Less than min domain!")
+        # tf.debugging.assert_less_equal(generated_images, 1.0, message="Grater than max domain!")
 
-            self.last_gen_imgs = np.expand_dims(generated_images, axis=3)
-            classify_digits(self.last_gen_imgs)
+        self.last_gen_imgs = np.expand_dims(generated_images, axis=3)
+        classify_digits(self.last_gen_imgs)
 
-            #(self.last_gen_imgs.shape)
-            gen_output = self.discriminator(self.last_gen_imgs, training=True)
-            real_output = self.discriminator(images, training=True)
-            real_output = tf.sigmoid(real_output).numpy()
+        #gen_output = self.discriminator(self.last_gen_imgs, training=True)
+        #real_output = self.discriminator(images, training=True)
+        #real_output = tf.sigmoid(real_output).numpy()
 
-            self.compute_losses(gen_output, real_output)
+        # Train discriminator
+        # (1) Update the discriminator with real data
+        self.discriminator.zero_grad()
+        # Format batch
+        real_cpu = images.to(self.device)
+        real_output = self.discriminator(real_cpu).view(-1)
+        # (2) Update the discriminator with fake data
+        reshape_ims = np.transpose(self.last_gen_imgs, axes=[0,3,1,2])
+        #print(reshape_ims.shape)
+        gen_output = self.discriminator(torch.from_numpy(reshape_ims).type(torch.FloatTensor)).view(-1)
+        # (3) compute losses
+        self.compute_losses(gen_output, real_output)
+        # Update Discriminator
+        self.disc_optimizer.step()
 
-            gradients_of_discriminator = disc_tape.gradient(self.dloss, self.discriminator.trainable_variables)
-            self.disc_optimizer.apply_gradients(zip(gradients_of_discriminator, self.discriminator.trainable_variables))
 
     def train(self, epochs = 1):
         start = time.time()
 
         for epoch in range(epochs):
             step = 0
-            for images in self.x_train:
-                self.train_step(images, step)
+            #for images in self.x_train:
+            for i, images in enumerate(self.dataloader, 0):
+                self.train_step(images[0], step)
                 if self.log_losses: self.write_losses_epochs(step, epoch)
                 if self.log_digits_class:
                     self.write_digits_classifications(step, epoch, self.last_gen_imgs)
@@ -285,7 +382,7 @@ class dcgan(object):
                 self.generate_and_save_images(step + 1, epoch + 1)
                 step += 1
 
-                print('[DCGAN - step {}/{} of epoch {}/{}]:\t[Gloss, Dloss]: [{}, {}]\tTime so far: {} sec'.format(step, len(self.x_train),
+                print('[DCGAN - step {}/{} of epoch {}/{}]:\t[Gloss, Dloss]: [{}, {}]\tTime so far: {} sec'.format(step, len(self.dataset),
                                                                                                                    epoch + 1, epochs, self.gloss,
                                                                                                                    self.dloss, time.time() - start))
             # Generate after the final epoch
@@ -338,7 +435,7 @@ class dcgan(object):
             fwriter = csv.writer(file, delimiter=',')
             if epoch == 0 and step == 0:
                 file.write("[d_loss, g_loss]\n")
-            fwriter.writerow([self.dloss.numpy(), self.gloss.numpy()])
+            fwriter.writerow([self.dloss.item(), self.gloss.item()])
 
 
     def write_digits_classifications(self, step, epoch, digits, classifications = True, path = None):
@@ -442,7 +539,7 @@ if __name__ == '__main__':
 
 
     # secondary test
-    gens = [50] # 50 # 1- teste maluco (tem de ser pelo menos 2)
+    gens = [5] # 50 # 1- teste maluco (tem de ser pelo menos 2)
     epochs = 2
     fsets = [std_set]
     runs = 1
@@ -458,7 +555,7 @@ if __name__ == '__main__':
                 for cur_set in fsets:
                     print("doing: ",r," digit ",d," for ", g, " generations, seed ", seeds[r])
                     sufix_str = 'digits_' + str(d) + "_base"
-                    mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=g, fset=cur_set, digits_to_train=d,
+                    mnist_dcgan = dcgan(batch_size=gen_pop, gens_per_batch=g, fset=cur_set, classes_to_train=d,
                                         run_from_last_pop=True,
                                         linear_gens_per_batch=True,
                                         do_archive=False,
